@@ -169,6 +169,9 @@ func TestCacheModel_DryRunIsReadOnly(t *testing.T) {
 	st, err := f.svc.CacheModel(context.Background(), &modelcache.Request{Project: "proj", Name: "model", DryRun: true})
 
 	require.NoError(t, err)
+	// No revision was requested: the status names the default branch.
+	require.Empty(t, st.RequestedRevision)
+	require.Equal(t, "main", st.Revision)
 	require.Equal(t, "c1", st.Commit)
 	require.Equal(t, int64(3), st.Totals.Files)
 	require.Equal(t, int64(160), st.Totals.Bytes)
@@ -407,6 +410,7 @@ func TestGetModelCache_IsReadOnly(t *testing.T) {
 	st, err := f.svc.GetModelCache(context.Background(), "proj", "model", "")
 
 	require.NoError(t, err)
+	require.Equal(t, "main", st.Revision)
 	require.Nil(t, st.Task)
 	require.Equal(t, modelcache.CacheStatePartial, st.State)
 	require.Equal(t, int64(2), st.Totals.CachedFiles)

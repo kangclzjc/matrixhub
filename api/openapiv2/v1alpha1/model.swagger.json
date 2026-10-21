@@ -1000,6 +1000,10 @@
         "requestedRevision": {
           "type": "string"
         },
+        "revision": {
+          "type": "string",
+          "description": "The branch, tag or commit that was listed: requested_revision, or the name\nof the default branch when none was requested. A dry run leaves it empty\nwhen the registry does not name its default branch."
+        },
         "commit": {
           "type": "string"
         },

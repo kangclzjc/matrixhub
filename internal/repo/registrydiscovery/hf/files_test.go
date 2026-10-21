@@ -87,22 +87,63 @@ func TestDiscovery_ListRevisionFiles(t *testing.T) {
 }
 
 func TestDiscovery_ListRevisionFiles_DefaultBranch(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/api/models/Qwen/Qwen3-0.6B":
-			fmt.Fprintf(w, `{"sha":%q}`, testSHA)
-		case "/api/models/Qwen/Qwen3-0.6B/tree/" + testSHA:
-			fmt.Fprint(w, `[]`)
-		default:
-			t.Errorf("unexpected request %s", r.URL)
-		}
-	}))
-	defer ts.Close()
-
-	got, err := New().ListRevisionFiles(context.Background(), &registry.Registry{URL: ts.URL}, "Qwen", "Qwen3-0.6B", "")
-	if err != nil || got.Commit != testSHA {
-		t.Fatalf("ListRevisionFiles() = %+v, %v", got, err)
+	const otherSHA = "607a30d783dfa663caf39e06633721c8d4cfcd7e"
+	tests := []struct {
+		name string
+		// refs answers the git ref advertisement; empty means 404.
+		refs string
+		want string
+	}{
+		{"named by the HEAD symref", advertisement(testSHA, "symref=HEAD:refs/heads/main"), "main"},
+		{"another branch name", advertisement(testSHA, "symref=HEAD:refs/heads/master"), "master"},
+		{"HEAD at another commit", advertisement(otherSHA, "symref=HEAD:refs/heads/main"), ""},
+		{"no symref", advertisement(testSHA, ""), ""},
+		{"no git endpoint", "", ""},
+		{"not an advertisement", "<html></html>", ""},
 	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/api/models/Qwen/Qwen3-0.6B":
+					fmt.Fprintf(w, `{"sha":%q}`, testSHA)
+				case "/api/models/Qwen/Qwen3-0.6B/tree/" + testSHA:
+					fmt.Fprint(w, `[{"type":"file","path":"config.json","size":726}]`)
+				case "/Qwen/Qwen3-0.6B/info/refs":
+					if r.URL.Query().Get("service") != "git-upload-pack" {
+						t.Errorf("unexpected ref request %s", r.URL)
+					}
+					if tt.refs == "" {
+						w.WriteHeader(http.StatusNotFound)
+						return
+					}
+					w.Header().Set("Content-Type", "application/x-git-upload-pack-advertisement")
+					fmt.Fprint(w, tt.refs)
+				default:
+					t.Errorf("unexpected request %s", r.URL)
+				}
+			}))
+			defer ts.Close()
+
+			got, err := New().ListRevisionFiles(context.Background(), &registry.Registry{URL: ts.URL}, "Qwen", "Qwen3-0.6B", "")
+			// The name only labels the listing: without it, the files are still listed.
+			if err != nil || got.Commit != testSHA || len(got.Files) != 1 {
+				t.Fatalf("ListRevisionFiles() = %+v, %v", got, err)
+			}
+			if got.Revision != tt.want {
+				t.Errorf("Revision = %q, want %q", got.Revision, tt.want)
+			}
+		})
+	}
+}
+
+// advertisement is a smart HTTP ref advertisement whose first ref is HEAD at
+// head, with the given capabilities.
+func advertisement(head, capabilities string) string {
+	pkt := func(s string) string { return fmt.Sprintf("%04x%s", len(s)+4, s) }
+	return pkt("# service=git-upload-pack\n") + "0000" +
+		pkt(head+" HEAD\x00multi_ack side-band-64k ofs-delta "+capabilities+"\n") +
+		pkt(head+" refs/heads/main\n") + "0000"
 }
 
 func TestDiscovery_ListRevisionFiles_Errors(t *testing.T) {

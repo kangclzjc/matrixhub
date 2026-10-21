@@ -119,7 +119,7 @@ func (s *Service) CacheModel(ctx context.Context, req *Request) (*CacheStatus, e
 		key := taskKey(req.Project, req.Name, remote.Commit, p.objects)
 		s.gc()
 		gitCached := s.localHasCommit(ctx, req.Project, req.Name, remote.Commit)
-		return s.buildStatus(ctx, req.Project, req.Name, req.Revision, remote.Commit, p, s.lookupTask(key), gitCached), nil
+		return s.buildStatus(ctx, req.Project, req.Name, req.Revision, remote, p, s.lookupTask(key), gitCached), nil
 	}
 
 	// Pulls of one model take turns, so two pulls of a new model do not both
@@ -194,7 +194,7 @@ func (s *Service) CacheModel(ctx context.Context, req *Request) (*CacheStatus, e
 	if err != nil {
 		return nil, err
 	}
-	return s.buildStatus(ctx, req.Project, req.Name, req.Revision, local.Commit, p, t, true), nil
+	return s.buildStatus(ctx, req.Project, req.Name, req.Revision, local, p, t, true), nil
 }
 
 func (s *Service) GetModelCache(ctx context.Context, project, name, revision string) (*CacheStatus, error) {
@@ -215,7 +215,7 @@ func (s *Service) GetModelCache(ctx context.Context, project, name, revision str
 	}
 	s.gc()
 	t := s.latestTask(project, name, local.Commit)
-	return s.buildStatus(ctx, project, name, revision, local.Commit, p, t, true), nil
+	return s.buildStatus(ctx, project, name, revision, local, p, t, true), nil
 }
 
 func (s *Service) Close() {
@@ -469,14 +469,16 @@ func (s *Service) gc() {
 	}
 }
 
-// buildStatus combines the selected files, the local storage and the task
-// state. gitCached tells whether files stored in git are present locally.
-func (s *Service) buildStatus(ctx context.Context, project, name, revision, commit string, p *plan, t *task, gitCached bool) *CacheStatus {
+// buildStatus combines the selected files of a listing, the local storage and
+// the task state. gitCached tells whether files stored in git are present
+// locally.
+func (s *Service) buildStatus(ctx context.Context, project, name, requested string, listed *git.RevisionFiles, p *plan, t *task, gitCached bool) *CacheStatus {
 	st := &CacheStatus{
 		Project:           project,
 		Name:              name,
-		RequestedRevision: revision,
-		Commit:            commit,
+		RequestedRevision: requested,
+		Revision:          listed.Revision,
+		Commit:            listed.Commit,
 		Warnings:          p.warnings,
 		Files:             make([]FileStatus, 0, len(p.files)),
 	}

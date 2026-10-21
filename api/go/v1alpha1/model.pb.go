@@ -2429,17 +2429,21 @@ type ModelCacheStatus struct {
 	Project           string                 `protobuf:"bytes,1,opt,name=project,proto3" json:"project,omitempty"`
 	Name              string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
 	RequestedRevision string                 `protobuf:"bytes,3,opt,name=requested_revision,json=requestedRevision,proto3" json:"requested_revision,omitempty"`
-	Commit            string                 `protobuf:"bytes,4,opt,name=commit,proto3" json:"commit,omitempty"`
+	// The branch, tag or commit that was listed: requested_revision, or the name
+	// of the default branch when none was requested. A dry run leaves it empty
+	// when the registry does not name its default branch.
+	Revision string `protobuf:"bytes,4,opt,name=revision,proto3" json:"revision,omitempty"`
+	Commit   string `protobuf:"bytes,5,opt,name=commit,proto3" json:"commit,omitempty"`
 	// How much of the selected files is cached; see CacheState.
-	State  CacheState        `protobuf:"varint,5,opt,name=state,proto3,enum=matrixhub.v1alpha1.CacheState" json:"state,omitempty"`
-	Totals *ModelCacheTotals `protobuf:"bytes,6,opt,name=totals,proto3" json:"totals,omitempty"`
-	Files  []*ModelCacheFile `protobuf:"bytes,7,rep,name=files,proto3" json:"files,omitempty"`
+	State  CacheState        `protobuf:"varint,6,opt,name=state,proto3,enum=matrixhub.v1alpha1.CacheState" json:"state,omitempty"`
+	Totals *ModelCacheTotals `protobuf:"bytes,7,opt,name=totals,proto3" json:"totals,omitempty"`
+	Files  []*ModelCacheFile `protobuf:"bytes,8,rep,name=files,proto3" json:"files,omitempty"`
 	// The latest pull that the server knows of: of the requested selection for
 	// CacheModel, of the commit for GetModelCache. Unset when there is none, for
 	// example when no pull was started, the last one finished more than an hour
 	// ago, or the server restarted since.
-	Task          *ModelCacheTask `protobuf:"bytes,8,opt,name=task,proto3" json:"task,omitempty"`
-	Warnings      []string        `protobuf:"bytes,9,rep,name=warnings,proto3" json:"warnings,omitempty"`
+	Task          *ModelCacheTask `protobuf:"bytes,9,opt,name=task,proto3" json:"task,omitempty"`
+	Warnings      []string        `protobuf:"bytes,10,rep,name=warnings,proto3" json:"warnings,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2491,6 +2495,13 @@ func (x *ModelCacheStatus) GetName() string {
 func (x *ModelCacheStatus) GetRequestedRevision() string {
 	if x != nil {
 		return x.RequestedRevision
+	}
+	return ""
+}
+
+func (x *ModelCacheStatus) GetRevision() string {
+	if x != nil {
+		return x.Revision
 	}
 	return ""
 }
@@ -2705,17 +2716,19 @@ const file_v1alpha1_model_proto_rawDesc = "" +
 	"started_at\x18\x03 \x01(\tR\tstartedAt\x12\x1f\n" +
 	"\vfinished_at\x18\x04 \x01(\tR\n" +
 	"finishedAt\x12\x14\n" +
-	"\x05error\x18\x05 \x01(\tR\x05error\"\x89\x03\n" +
+	"\x05error\x18\x05 \x01(\tR\x05error\"\xa5\x03\n" +
 	"\x10ModelCacheStatus\x12\x18\n" +
 	"\aproject\x18\x01 \x01(\tR\aproject\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12-\n" +
-	"\x12requested_revision\x18\x03 \x01(\tR\x11requestedRevision\x12\x16\n" +
-	"\x06commit\x18\x04 \x01(\tR\x06commit\x124\n" +
-	"\x05state\x18\x05 \x01(\x0e2\x1e.matrixhub.v1alpha1.CacheStateR\x05state\x12<\n" +
-	"\x06totals\x18\x06 \x01(\v2$.matrixhub.v1alpha1.ModelCacheTotalsR\x06totals\x128\n" +
-	"\x05files\x18\a \x03(\v2\".matrixhub.v1alpha1.ModelCacheFileR\x05files\x126\n" +
-	"\x04task\x18\b \x01(\v2\".matrixhub.v1alpha1.ModelCacheTaskR\x04task\x12\x1a\n" +
-	"\bwarnings\x18\t \x03(\tR\bwarnings*\x1d\n" +
+	"\x12requested_revision\x18\x03 \x01(\tR\x11requestedRevision\x12\x1a\n" +
+	"\brevision\x18\x04 \x01(\tR\brevision\x12\x16\n" +
+	"\x06commit\x18\x05 \x01(\tR\x06commit\x124\n" +
+	"\x05state\x18\x06 \x01(\x0e2\x1e.matrixhub.v1alpha1.CacheStateR\x05state\x12<\n" +
+	"\x06totals\x18\a \x01(\v2$.matrixhub.v1alpha1.ModelCacheTotalsR\x06totals\x128\n" +
+	"\x05files\x18\b \x03(\v2\".matrixhub.v1alpha1.ModelCacheFileR\x05files\x126\n" +
+	"\x04task\x18\t \x01(\v2\".matrixhub.v1alpha1.ModelCacheTaskR\x04task\x12\x1a\n" +
+	"\bwarnings\x18\n" +
+	" \x03(\tR\bwarnings*\x1d\n" +
 	"\bFileType\x12\a\n" +
 	"\x03DIR\x10\x00\x12\b\n" +
 	"\x04FILE\x10\x01*G\n" +
