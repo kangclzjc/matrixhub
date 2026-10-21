@@ -364,6 +364,36 @@ func TestModelService_RefreshFromRemoteIgnoresSyncTTL(t *testing.T) {
 	require.ErrorIs(t, err, pullErr)
 }
 
+func TestModelService_RefreshFromRemoteDoesNotCreateModel(t *testing.T) {
+	ctx := context.Background()
+	ctrl := gomock.NewController(t)
+	modelRepo := modelmocks.NewMockIModelRepo(ctrl)
+	gitRepo := gitmocks.NewMockIGitRepo(ctrl)
+	registryRepo := registrymocks.NewMockIRegistryRepo(ctrl)
+	registryID := 1
+	projectRepo := projectmocks.NewMockIProjectRepo(ctrl)
+	projectRepo.EXPECT().
+		GetProjectByName(gomock.Any(), "proj").
+		Return(&project.Project{Name: "proj", RegistryID: &registryID, Organization: "upstream-org"}, nil)
+
+	// No repository or record may be created, and nothing is pulled.
+	modelRepo.EXPECT().
+		GetByProjectAndName(ctx, "proj", "model").
+		Return(nil, errors.New("record not found"))
+
+	service := model.NewModelService(
+		modelRepo,
+		nil,
+		gitRepo,
+		projectRepo,
+		registryRepo,
+	)
+
+	err := service.RefreshFromRemote(ctx, "proj", "model")
+
+	require.ErrorContains(t, err, "not found")
+}
+
 func TestModelService_CheckOrSyncFromRemoteRecordsSuccessfulSync(t *testing.T) {
 	ctx := context.Background()
 	ctrl := gomock.NewController(t)

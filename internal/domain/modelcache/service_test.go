@@ -36,6 +36,7 @@ import (
 	"github.com/matrixhub-ai/matrixhub/internal/domain/registry"
 	registrymocks "github.com/matrixhub-ai/matrixhub/internal/domain/registry/mocks"
 	"github.com/matrixhub-ai/matrixhub/internal/domain/registrydiscovery"
+	registrydiscoverymocks "github.com/matrixhub-ai/matrixhub/internal/domain/registrydiscovery/mocks"
 )
 
 const (
@@ -53,20 +54,13 @@ func revisionFiles() *git.RevisionFiles {
 	}}
 }
 
-type fakeLister struct {
+// upstream is what the mocked RemoteFileLister answers.
+type upstream struct {
 	files *git.RevisionFiles
 	err   error
 	calls atomic.Int32
 	// onList, when set, runs inside every listing.
 	onList func()
-}
-
-func (l *fakeLister) ListRevisionFiles(context.Context, *registry.Registry, string, string, string) (*git.RevisionFiles, error) {
-	l.calls.Add(1)
-	if l.onList != nil {
-		l.onList()
-	}
-	return l.files, l.err
 }
 
 type download struct{ done, total int64 }
@@ -77,7 +71,7 @@ func (d download) Total() int64      { return d.total }
 type fixture struct {
 	models *modelmocks.MockIModelService
 	git    *gitmocks.MockIGitRepo
-	lister *fakeLister
+	lister *upstream
 	disk   sync.Map
 	svc    modelcache.IModelCacheService
 }
@@ -88,8 +82,17 @@ func newFixture(t *testing.T, opts modelcache.Options) *fixture {
 	f := &fixture{
 		models: modelmocks.NewMockIModelService(ctrl),
 		git:    gitmocks.NewMockIGitRepo(ctrl),
-		lister: &fakeLister{files: revisionFiles()},
+		lister: &upstream{files: revisionFiles()},
 	}
+	lister := registrydiscoverymocks.NewMockRemoteFileLister(ctrl)
+	lister.EXPECT().ListRevisionFiles(gomock.Any(), gomock.Any(), "Org", gomock.Any(), gomock.Any()).
+		DoAndReturn(func(context.Context, *registry.Registry, string, string, string) (*git.RevisionFiles, error) {
+			f.lister.calls.Add(1)
+			if f.lister.onList != nil {
+				f.lister.onList()
+			}
+			return f.lister.files, f.lister.err
+		}).AnyTimes()
 
 	registryID := 1
 	projects := projectmocks.NewMockIProjectRepo(ctrl)
@@ -115,7 +118,7 @@ func newFixture(t *testing.T, opts modelcache.Options) *fixture {
 	if opts.RequeueMinInterval == 0 {
 		opts.RequeueMinInterval = time.Nanosecond
 	}
-	f.svc = modelcache.NewModelCacheService(f.models, projects, registries, f.git, f.lister, opts)
+	f.svc = modelcache.NewModelCacheService(f.models, projects, registries, f.git, lister, opts)
 	// Registered after the controller, so it runs first: workers stop before
 	// the controller verifies its expectations.
 	t.Cleanup(f.svc.Close)
@@ -210,18 +213,21 @@ func TestCacheModel_NewModelIsCheckedUpstreamBeforeSync(t *testing.T) {
 	require.ErrorIs(t, err, modelcache.ErrRevisionNotFound)
 }
 
-func TestCacheModel_RollsBackNewModelWhenSyncFails(t *testing.T) {
+// Upstream was checked before the sync, so a sync that fails keeps the new
+// model, as a failed proxy download does: the sync may have queued downloads
+// already, and the next pull or download syncs the model again.
+func TestCacheModel_KeepsNewModelWhenSyncFails(t *testing.T) {
 	f := newFixture(t, modelcache.Options{})
-	syncErr := errors.New("failed to list remote refs")
+	syncErr := errors.New("update model metadata: context canceled")
 	gomock.InOrder(
 		f.models.EXPECT().GetModel(gomock.Any(), "proj", "model").Return(nil, errModelNotFound),
 		f.models.EXPECT().CheckOrSyncFromRemote(gomock.Any(), "proj", "model").Return(syncErr),
-		f.models.EXPECT().GetModel(gomock.Any(), "proj", "model").Return(&model.Model{Name: "model"}, nil),
-		f.models.EXPECT().DeleteModel(gomock.Any(), "proj", "model").Return(nil),
 	)
 
 	_, err := f.svc.CacheModel(context.Background(), &modelcache.Request{Project: "proj", Name: "model"})
 
+	// No DeleteModel expectation: the strict mock fails the test if the
+	// model is deleted.
 	require.ErrorIs(t, err, modelcache.ErrUpstreamSync)
 	require.ErrorIs(t, err, syncErr)
 }
@@ -513,6 +519,8 @@ func TestCacheModel_RevisionMissingAfterRefresh(t *testing.T) {
 		// For example a commit that only a pull request ref reaches.
 		{"upstream has it outside mirrored refs", nil, modelcache.ErrRevisionNotMirrored},
 		{"upstream does not have it", registrydiscovery.ErrRemoteNotFound, modelcache.ErrRevisionNotFound},
+		// The revision may exist, so the failure is not reported as NotFound.
+		{"upstream is unavailable", registrydiscovery.ErrRemoteUnavailable, modelcache.ErrUpstreamUnavailable},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -677,7 +685,8 @@ func TestCacheModel_PreviewShowsRunningDownloads(t *testing.T) {
 func TestClose_InterruptsRunningTasks(t *testing.T) {
 	f := newFixture(t, modelcache.Options{})
 	f.existingModel()
-	f.models.EXPECT().CheckOrSyncFromRemote(gomock.Any(), "proj", "model").Return(nil).Times(2)
+	// Once: the pull after Close fails before it syncs.
+	f.models.EXPECT().CheckOrSyncFromRemote(gomock.Any(), "proj", "model").Return(nil)
 	f.git.EXPECT().FetchLFSObject(gomock.Any(), gomock.Any()).Return(download{done: 1, total: 100}).AnyTimes()
 	_, err := f.svc.CacheModel(context.Background(), pullModel)
 	require.NoError(t, err)
@@ -729,7 +738,9 @@ func TestCacheModel_RequeueIsRateLimited(t *testing.T) {
 }
 
 func TestCacheModel_RequeueDoesNotRecreateADeletedModel(t *testing.T) {
-	f := newFixture(t, modelcache.Options{MaxAttempts: 1})
+	// A retry would wait out the backoff, so the task only fails in time if
+	// a deleted model ends the object.
+	f := newFixture(t, modelcache.Options{MaxAttempts: 3, RetryBackoff: time.Hour})
 	var deleted atomic.Bool
 	f.models.EXPECT().GetModel(gomock.Any(), "proj", "model").
 		DoAndReturn(func(context.Context, string, string) (*model.Model, error) {
@@ -748,10 +759,14 @@ func TestCacheModel_RequeueDoesNotRecreateADeletedModel(t *testing.T) {
 			return nil
 		}).AnyTimes()
 
+	// RefreshFromRemote never creates a model, so it fails for a deleted
+	// one; see TestModelService_RefreshFromRemoteDoesNotCreateModel.
+	f.models.EXPECT().RefreshFromRemote(gomock.Any(), "proj", "model").
+		Return(errors.New("model proj/model not found")).MinTimes(1)
+
 	_, err := f.svc.CacheModel(context.Background(), pullModel)
 	require.NoError(t, err)
 
-	// No RefreshFromRemote expectation: the sync would re-create the model.
 	// The model is gone, so the run is observed through a preview.
 	var st *modelcache.CacheStatus
 	require.Eventually(t, func() bool {
@@ -760,7 +775,97 @@ func TestCacheModel_RequeueDoesNotRecreateADeletedModel(t *testing.T) {
 	}, 5*time.Second, 2*time.Millisecond)
 	for _, file := range st.Files {
 		if file.IsLFS {
-			require.Contains(t, file.Error, "no longer available")
+			require.Contains(t, file.Error, "deleted")
+		}
+	}
+}
+
+func TestCacheModel_RequeueWithinIntervalReportsLastError(t *testing.T) {
+	// One object at a time, so the second object's requeue falls within the
+	// interval of the first one's.
+	f := newFixture(t, modelcache.Options{MaxAttempts: 1, PerTaskConcurrency: 1, RequeueMinInterval: time.Hour})
+	f.existingModel()
+	f.models.EXPECT().CheckOrSyncFromRemote(gomock.Any(), "proj", "model").Return(nil)
+	// The mirror tracks neither object, and the one refresh fails.
+	f.git.EXPECT().FetchLFSObject(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+	f.models.EXPECT().RefreshFromRemote(gomock.Any(), "proj", "model").
+		Return(errors.New("open /data/repositories/proj/model.git: permission denied")).Times(1)
+
+	_, err := f.svc.CacheModel(context.Background(), pullModel)
+	require.NoError(t, err)
+
+	// Both objects report the failed refresh, although only the first ran
+	// it, and neither shows the server path.
+	st := waitForTask(t, f, modelcache.TaskFailed)
+	for _, file := range st.Files {
+		if file.IsLFS {
+			require.Contains(t, file.Error, "refreshing the model from upstream failed")
+			require.NotContains(t, file.Error, "/data")
+		}
+	}
+}
+
+func TestCacheModel_RefreshIsBounded(t *testing.T) {
+	f := newFixture(t, modelcache.Options{MaxAttempts: 1, RefreshTimeout: 20 * time.Millisecond})
+	f.existingModel()
+	f.models.EXPECT().CheckOrSyncFromRemote(gomock.Any(), "proj", "model").Return(nil)
+	f.git.EXPECT().FetchLFSObject(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+	// The refresh hangs until its context ends.
+	f.models.EXPECT().RefreshFromRemote(gomock.Any(), "proj", "model").
+		DoAndReturn(func(ctx context.Context, _, _ string) error {
+			<-ctx.Done()
+			return ctx.Err()
+		}).MinTimes(1)
+
+	_, err := f.svc.CacheModel(context.Background(), pullModel)
+	require.NoError(t, err)
+
+	waitForTask(t, f, modelcache.TaskFailed)
+}
+
+// The mirror stores a finished download before it forgets it, so a download
+// that disappears between two checks is found in storage.
+func TestCacheModel_DownloadThatDisappearsIsFoundInStorage(t *testing.T) {
+	f := newFixture(t, modelcache.Options{MaxAttempts: 1})
+	f.existingModel()
+	f.models.EXPECT().CheckOrSyncFromRemote(gomock.Any(), "proj", "model").Return(nil)
+	f.disk.Store(oidB, true)
+	var calls atomic.Int32
+	f.git.EXPECT().FetchLFSObject(gomock.Any(), oidA).
+		DoAndReturn(func(context.Context, string) git.LFSDownload {
+			if calls.Add(1) == 1 {
+				return download{done: 50, total: 100}
+			}
+			// The download finished: it is stored, then forgotten.
+			f.disk.Store(oidA, true)
+			return nil
+		}).AnyTimes()
+
+	_, err := f.svc.CacheModel(context.Background(), pullModel)
+	require.NoError(t, err)
+
+	waitForTask(t, f, modelcache.TaskSucceeded)
+}
+
+func TestCacheModel_FinishedDownloadThatIsNeverStoredFails(t *testing.T) {
+	// A retry would wait out the backoff, so the task only fails in time if
+	// the store timeout ends the object.
+	f := newFixture(t, modelcache.Options{StoreTimeout: 20 * time.Millisecond, RetryBackoff: time.Hour})
+	f.existingModel()
+	f.models.EXPECT().CheckOrSyncFromRemote(gomock.Any(), "proj", "model").Return(nil)
+	f.disk.Store(oidB, true)
+	// The download is complete, but a client keeps reading it, so the
+	// mirror never stores it. Waiting for readers is not a stall.
+	f.git.EXPECT().FetchLFSObject(gomock.Any(), oidA).Return(download{done: 100, total: 100}).AnyTimes()
+
+	_, err := f.svc.CacheModel(context.Background(), pullModel)
+	require.NoError(t, err)
+
+	st := waitForTask(t, f, modelcache.TaskFailed)
+	for _, file := range st.Files {
+		if file.OID == oidA {
+			require.Equal(t, modelcache.FileFailed, file.State)
+			require.Contains(t, file.Error, "not stored")
 		}
 	}
 }

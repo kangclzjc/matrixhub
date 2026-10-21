@@ -33,8 +33,9 @@ const testSHA = "c1899de289a04d12100db370d81485cdf75e47ca"
 func TestDiscovery_ListRevisionFiles(t *testing.T) {
 	var ts *httptest.Server
 	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.Header.Get("Authorization"); got != "Bearer secret" {
-			t.Errorf("Authorization = %q", got)
+		// The registry has a credential, but the listing must not send it.
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Errorf("Authorization = %q, want none", got)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		switch {

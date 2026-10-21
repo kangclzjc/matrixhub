@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-	"time"
 
 	"golang.org/x/sync/singleflight"
 
@@ -52,7 +51,7 @@ type Service struct {
 	// task.mu.
 	mu           sync.Mutex
 	tasks        map[string]*task
-	lastRequeue  map[string]time.Time
+	lastRequeue  map[string]requeueResult
 	modelLocks   map[string]*modelLock
 	global       chan struct{}
 	requeueGroup singleflight.Group
@@ -86,13 +85,16 @@ func NewModelCacheService(
 		ctx:         ctx,
 		cancel:      cancel,
 		tasks:       map[string]*task{},
-		lastRequeue: map[string]time.Time{},
+		lastRequeue: map[string]requeueResult{},
 		modelLocks:  map[string]*modelLock{},
 		global:      make(chan struct{}, opts.GlobalConcurrency),
 	}
 }
 
 func (s *Service) CacheModel(ctx context.Context, req *Request) (*CacheStatus, error) {
+	if s.ctx.Err() != nil {
+		return nil, ErrClosed
+	}
 	if err := validateRevision(req.Revision); err != nil {
 		return nil, err
 	}
@@ -110,15 +112,18 @@ func (s *Service) CacheModel(ctx context.Context, req *Request) (*CacheStatus, e
 		if err != nil {
 			return nil, err
 		}
-		p := sel.plan(remote.Files)
+		p, err := sel.plan(remote.Files)
+		if err != nil {
+			return nil, err
+		}
 		key := taskKey(req.Project, req.Name, remote.Commit, p.objects)
 		s.gc()
 		gitCached := s.localHasCommit(ctx, req.Project, req.Name, remote.Commit)
 		return s.buildStatus(ctx, req.Project, req.Name, req.Revision, remote.Commit, p, s.lookupTask(key), gitCached), nil
 	}
 
-	// Pulls of one model take turns, so a pull never deletes a model that a
-	// concurrent pull created.
+	// Pulls of one model take turns, so two pulls of a new model do not both
+	// try to create it.
 	unlock, err := s.lockModel(ctx, req.Project+"/"+req.Name)
 	if err != nil {
 		return nil, err
@@ -131,13 +136,19 @@ func (s *Service) CacheModel(ctx context.Context, req *Request) (*CacheStatus, e
 	}
 	// remote is only listed for a new model: the sync creates the model, so
 	// everything that upstream can tell is checked first, and a request that
-	// cannot succeed leaves nothing behind.
+	// cannot succeed creates nothing. A sync that fails after that keeps the
+	// model, as a failed proxy download does, and the next pull or download
+	// syncs it again.
 	var remote *git.RevisionFiles
 	if !existed {
 		if remote, err = s.listUpstream(ctx, prj, reg, req.Name, req.Revision); err != nil {
 			return nil, err
 		}
-		if len(sel.plan(remote.Files).files) == 0 {
+		p, err := sel.plan(remote.Files)
+		if err != nil {
+			return nil, err
+		}
+		if len(p.files) == 0 {
 			return nil, fmt.Errorf("%w: the selection matched no files", ErrInvalidSelection)
 		}
 		if err := s.checkCapacity(); err != nil {
@@ -145,9 +156,6 @@ func (s *Service) CacheModel(ctx context.Context, req *Request) (*CacheStatus, e
 		}
 	}
 	if err := s.models.CheckOrSyncFromRemote(ctx, req.Project, req.Name); err != nil {
-		if !existed {
-			s.rollbackNewModel(context.WithoutCancel(ctx), req.Project, req.Name)
-		}
 		return nil, fmt.Errorf("%w: %w", ErrUpstreamSync, err)
 	}
 
@@ -166,7 +174,10 @@ func (s *Service) CacheModel(ctx context.Context, req *Request) (*CacheStatus, e
 		return nil, err
 	}
 
-	p := sel.plan(local.Files)
+	p, err := sel.plan(local.Files)
+	if err != nil {
+		return nil, err
+	}
 	if len(p.files) == 0 {
 		return nil, fmt.Errorf("%w: the selection matched no files", ErrInvalidSelection)
 	}
@@ -198,9 +209,13 @@ func (s *Service) GetModelCache(ctx context.Context, project, name, revision str
 	if err != nil {
 		return nil, err
 	}
+	p, err := selectAll.plan(local.Files)
+	if err != nil {
+		return nil, err
+	}
 	s.gc()
 	t := s.latestTask(project, name, local.Commit)
-	return s.buildStatus(ctx, project, name, revision, local.Commit, selectAll.plan(local.Files), t, true), nil
+	return s.buildStatus(ctx, project, name, revision, local.Commit, p, t, true), nil
 }
 
 func (s *Service) Close() {
@@ -232,7 +247,10 @@ func (s *Service) explainMissingRevision(ctx context.Context, prj *project.Proje
 	if remote == nil {
 		var err error
 		if remote, err = s.listUpstream(ctx, prj, reg, req.Name, req.Revision); err != nil {
-			return notFound
+			if errors.Is(err, ErrRevisionNotFound) {
+				return notFound
+			}
+			return err
 		}
 	}
 	return fmt.Errorf("%w: %s resolves to %s upstream", ErrRevisionNotMirrored, revisionLabel(req.Revision), remote.Commit)
@@ -336,18 +354,6 @@ func (s *Service) modelExists(ctx context.Context, project, name string) (bool, 
 		return false, nil
 	}
 	return false, err
-}
-
-// rollbackNewModel removes a model whose first sync failed, unless the model
-// was synced in the meantime, e.g. by a proxy download.
-func (s *Service) rollbackNewModel(ctx context.Context, project, name string) {
-	mod, err := s.models.GetModel(ctx, project, name)
-	if err != nil || mod.SyncedAt != nil {
-		return
-	}
-	if err := s.models.DeleteModel(ctx, project, name); err != nil {
-		log.Warnf("model cache: roll back model %s/%s after failed sync: %v", project, name, err)
-	}
 }
 
 func (s *Service) lookupTask(key string) *task {
@@ -456,8 +462,8 @@ func (s *Service) gc() {
 			delete(s.tasks, key)
 		}
 	}
-	for key, at := range s.lastRequeue {
-		if now.Sub(at) > s.opts.FinishedTaskTTL {
+	for key, r := range s.lastRequeue {
+		if now.Sub(r.at) > s.opts.FinishedTaskTTL {
 			delete(s.lastRequeue, key)
 		}
 	}

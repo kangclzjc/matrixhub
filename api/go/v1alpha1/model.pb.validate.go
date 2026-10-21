@@ -4047,10 +4047,21 @@ func (m *GetModelCacheRequest) validate(all bool) error {
 		errors = append(errors, err)
 	}
 
-	if utf8.RuneCountInString(m.GetName()) < 1 {
+	if l := utf8.RuneCountInString(m.GetName()); l < 1 || l > 251 {
 		err := GetModelCacheRequestValidationError{
 			field:  "Name",
-			reason: "value length must be at least 1 runes",
+			reason: "value length must be between 1 and 251 runes, inclusive",
+		}
+		if !all {
+			return err
+		}
+		errors = append(errors, err)
+	}
+
+	if !_GetModelCacheRequest_Name_Pattern.MatchString(m.GetName()) {
+		err := GetModelCacheRequestValidationError{
+			field:  "Name",
+			reason: "value does not match regex pattern \"^[A-Za-z0-9][A-Za-z0-9_.-]*$\"",
 		}
 		if !all {
 			return err
@@ -4155,6 +4166,8 @@ var _GetModelCacheRequest_Name_NotInLookup = map[string]struct{}{
 	"spaces":   {},
 	"resolve":  {},
 }
+
+var _GetModelCacheRequest_Name_Pattern = regexp.MustCompile("^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 // Validate checks the field values on ModelCacheFile with the rules defined in
 // the proto definition for this message. If any rules are violated, the first

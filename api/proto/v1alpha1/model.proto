@@ -324,17 +324,28 @@ message CacheModelRequest {
   // refs/pr/1, are rejected: MatrixHub mirrors only branches and tags.
   string revision = 3 [(validate.rules).string.max_len = 255];
   // Narrow the cached files; without patterns every file of the revision is
-  // cached. huggingface_hub fnmatch semantics: '*' and '?' also match '/', and
-  // a trailing '/' selects a whole directory. A pattern holds at most 16
+  // cached. Patterns follow huggingface_hub fnmatch semantics: '*' and '?'
+  // also match '/', and a trailing '/' selects a whole directory. A list
+  // holds at most 16 patterns, and a pattern at most 256 characters and 16
   // wildcards ('*', '?' and classes).
   repeated string allow_patterns = 4 [(validate.rules).repeated = {max_items: 16, items: {string: {min_len: 1, max_len: 256}}}];
+  // Files that match an ignore pattern are not cached, even when they match
+  // an allow pattern. Same syntax and limits as allow_patterns.
   repeated string ignore_patterns = 5 [(validate.rules).repeated = {max_items: 16, items: {string: {min_len: 1, max_len: 256}}}];
+  // Only report what a pull would do: the upstream files of the revision and
+  // which of them are cached. A dry run creates nothing and downloads
+  // nothing.
   bool dry_run = 6;
 }
 
 message GetModelCacheRequest {
   string project = 1 [(validate.rules).string.min_len = 1];
-  string name = 2 [(validate.rules).string = {min_len: 1, not_in: ["models", "datasets", "spaces", "resolve"]}];
+  string name = 2 [(validate.rules).string = {
+    min_len: 1,
+    max_len: 251,
+    pattern: "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+    not_in: ["models", "datasets", "spaces", "resolve"]
+  }];
   // Branch, tag or commit. Empty means the default branch.
   string revision = 3 [(validate.rules).string.max_len = 255];
 }
@@ -352,10 +363,13 @@ message ModelCacheFile {
 
 message ModelCacheTotals {
   int64 files = 1;
+  // Total size of the files.
   int64 bytes = 2;
   int64 cached_files = 3;
   int64 cached_bytes = 4;
   int64 downloading_files = 5;
+  // Bytes downloaded so far of the files in DOWNLOADING state, not their
+  // size.
   int64 downloading_bytes = 6;
   int64 queued_files = 7;
   int64 missing_files = 8;
@@ -377,13 +391,14 @@ message ModelCacheStatus {
   string name = 2;
   string requested_revision = 3;
   string commit = 4;
-  CacheState state = 9;
-  ModelCacheTotals totals = 5;
-  repeated ModelCacheFile files = 6;
+  // How much of the selected files is cached; see CacheState.
+  CacheState state = 5;
+  ModelCacheTotals totals = 6;
+  repeated ModelCacheFile files = 7;
   // The latest pull that the server knows of: of the requested selection for
   // CacheModel, of the commit for GetModelCache. Unset when there is none, for
   // example when no pull was started, the last one finished more than an hour
   // ago, or the server restarted since.
-  ModelCacheTask task = 7;
-  repeated string warnings = 8;
+  ModelCacheTask task = 8;
+  repeated string warnings = 9;
 }

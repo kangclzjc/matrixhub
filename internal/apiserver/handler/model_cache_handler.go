@@ -36,10 +36,6 @@ func (mh *ModelHandler) CacheModel(ctx context.Context, request *modelv1alpha1.C
 	if allowed, err := mh.authzService.VerifyProjectPermissionByName(ctx, request.Project, role.ModelPush); err != nil || !allowed {
 		return nil, status.Error(codes.PermissionDenied, "permission denied")
 	}
-	if mh.cache == nil {
-		return nil, status.Error(codes.Unimplemented, "model cache is not enabled")
-	}
-
 	st, err := mh.cache.CacheModel(ctx, &modelcache.Request{
 		Project:  request.Project,
 		Name:     request.Name,
@@ -51,7 +47,7 @@ func (mh *ModelHandler) CacheModel(ctx context.Context, request *modelv1alpha1.C
 		DryRun: request.DryRun,
 	})
 	if err != nil {
-		return nil, modelCacheErrorToStatus(err)
+		return nil, modelCacheErrorToStatus(ctx, err)
 	}
 	return modelCacheStatusToProto(st), nil
 }
@@ -64,21 +60,24 @@ func (mh *ModelHandler) GetModelCache(ctx context.Context, request *modelv1alpha
 	if allowed, err := mh.authzService.VerifyProjectPermissionByName(ctx, request.Project, role.ModelGet); err != nil || !allowed {
 		return nil, status.Error(codes.PermissionDenied, "permission denied")
 	}
-	if mh.cache == nil {
-		return nil, status.Error(codes.Unimplemented, "model cache is not enabled")
-	}
-
 	st, err := mh.cache.GetModelCache(ctx, request.Project, request.Name, request.Revision)
 	if err != nil {
-		return nil, modelCacheErrorToStatus(err)
+		return nil, modelCacheErrorToStatus(ctx, err)
 	}
 	return modelCacheStatusToProto(st), nil
 }
 
 // modelCacheErrorToStatus maps service errors to gRPC statuses. Errors that
 // wrap local storage or sync failures can carry server paths, so they are
-// logged and answered with the sentinel message only.
-func modelCacheErrorToStatus(err error) error {
+// logged and answered with the sentinel message only. A request that ended
+// is reported as such first: its error is not a failure of upstream.
+func modelCacheErrorToStatus(ctx context.Context, err error) error {
+	switch ctxErr := ctx.Err(); {
+	case errors.Is(ctxErr, context.Canceled):
+		return status.Error(codes.Canceled, "request canceled")
+	case errors.Is(ctxErr, context.DeadlineExceeded):
+		return status.Error(codes.DeadlineExceeded, "request timed out")
+	}
 	switch {
 	case errors.Is(err, modelcache.ErrInvalidSelection), errors.Is(err, modelcache.ErrUnsupportedRevision):
 		return status.Error(codes.InvalidArgument, err.Error())
@@ -88,8 +87,9 @@ func modelCacheErrorToStatus(err error) error {
 		log.Debugf("model cache: %v", err)
 		return status.Error(codes.NotFound, modelcache.ErrRevisionNotFound.Error())
 	case errors.Is(err, modelcache.ErrUpstreamSync):
+		// Usually upstream is down, which a retry can fix.
 		log.Warnf("model cache: %v", err)
-		return status.Error(codes.FailedPrecondition, modelcache.ErrUpstreamSync.Error())
+		return status.Error(codes.Unavailable, modelcache.ErrUpstreamSync.Error())
 	case errors.Is(err, modelcache.ErrNotProxyProject),
 		errors.Is(err, modelcache.ErrRevisionNotMirrored),
 		errors.Is(err, modelcache.ErrUpstreamAccessDenied):
@@ -98,10 +98,6 @@ func modelCacheErrorToStatus(err error) error {
 		return status.Error(codes.Unavailable, err.Error())
 	case errors.Is(err, modelcache.ErrTooManyTasks):
 		return status.Error(codes.ResourceExhausted, err.Error())
-	case errors.Is(err, context.Canceled):
-		return status.Error(codes.Canceled, "request canceled")
-	case errors.Is(err, context.DeadlineExceeded):
-		return status.Error(codes.DeadlineExceeded, "request timed out")
 	default:
 		log.Errorf("model cache operation failed: %v", err)
 		return status.Error(codes.Internal, "model cache operation failed")
