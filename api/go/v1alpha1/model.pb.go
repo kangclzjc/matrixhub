@@ -1993,14 +1993,20 @@ type CacheModelRequest struct {
 	// refs/pr/1, are rejected: MatrixHub mirrors only branches and tags.
 	Revision string `protobuf:"bytes,3,opt,name=revision,proto3" json:"revision,omitempty"`
 	// Narrow the cached files; without patterns every file of the revision is
-	// cached. huggingface_hub fnmatch semantics: '*' and '?' also match '/', and
-	// a trailing '/' selects a whole directory. A pattern holds at most 16
+	// cached. Patterns follow huggingface_hub fnmatch semantics: '*' and '?'
+	// also match '/', and a trailing '/' selects a whole directory. A list
+	// holds at most 16 patterns, and a pattern at most 256 characters and 16
 	// wildcards ('*', '?' and classes).
-	AllowPatterns  []string `protobuf:"bytes,4,rep,name=allow_patterns,json=allowPatterns,proto3" json:"allow_patterns,omitempty"`
+	AllowPatterns []string `protobuf:"bytes,4,rep,name=allow_patterns,json=allowPatterns,proto3" json:"allow_patterns,omitempty"`
+	// Files that match an ignore pattern are not cached, even when they match
+	// an allow pattern. Same syntax and limits as allow_patterns.
 	IgnorePatterns []string `protobuf:"bytes,5,rep,name=ignore_patterns,json=ignorePatterns,proto3" json:"ignore_patterns,omitempty"`
-	DryRun         bool     `protobuf:"varint,6,opt,name=dry_run,json=dryRun,proto3" json:"dry_run,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Only report what a pull would do: the upstream files of the revision and
+	// which of them are cached. A dry run creates nothing and downloads
+	// nothing.
+	DryRun        bool `protobuf:"varint,6,opt,name=dry_run,json=dryRun,proto3" json:"dry_run,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *CacheModelRequest) Reset() {
@@ -2230,16 +2236,19 @@ func (x *ModelCacheFile) GetError() string {
 }
 
 type ModelCacheTotals struct {
-	state            protoimpl.MessageState `protogen:"open.v1"`
-	Files            int64                  `protobuf:"varint,1,opt,name=files,proto3" json:"files,omitempty"`
-	Bytes            int64                  `protobuf:"varint,2,opt,name=bytes,proto3" json:"bytes,omitempty"`
-	CachedFiles      int64                  `protobuf:"varint,3,opt,name=cached_files,json=cachedFiles,proto3" json:"cached_files,omitempty"`
-	CachedBytes      int64                  `protobuf:"varint,4,opt,name=cached_bytes,json=cachedBytes,proto3" json:"cached_bytes,omitempty"`
-	DownloadingFiles int64                  `protobuf:"varint,5,opt,name=downloading_files,json=downloadingFiles,proto3" json:"downloading_files,omitempty"`
-	DownloadingBytes int64                  `protobuf:"varint,6,opt,name=downloading_bytes,json=downloadingBytes,proto3" json:"downloading_bytes,omitempty"`
-	QueuedFiles      int64                  `protobuf:"varint,7,opt,name=queued_files,json=queuedFiles,proto3" json:"queued_files,omitempty"`
-	MissingFiles     int64                  `protobuf:"varint,8,opt,name=missing_files,json=missingFiles,proto3" json:"missing_files,omitempty"`
-	FailedFiles      int64                  `protobuf:"varint,9,opt,name=failed_files,json=failedFiles,proto3" json:"failed_files,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Files int64                  `protobuf:"varint,1,opt,name=files,proto3" json:"files,omitempty"`
+	// Total size of the files.
+	Bytes            int64 `protobuf:"varint,2,opt,name=bytes,proto3" json:"bytes,omitempty"`
+	CachedFiles      int64 `protobuf:"varint,3,opt,name=cached_files,json=cachedFiles,proto3" json:"cached_files,omitempty"`
+	CachedBytes      int64 `protobuf:"varint,4,opt,name=cached_bytes,json=cachedBytes,proto3" json:"cached_bytes,omitempty"`
+	DownloadingFiles int64 `protobuf:"varint,5,opt,name=downloading_files,json=downloadingFiles,proto3" json:"downloading_files,omitempty"`
+	// Bytes downloaded so far of the files in DOWNLOADING state, not their
+	// size.
+	DownloadingBytes int64 `protobuf:"varint,6,opt,name=downloading_bytes,json=downloadingBytes,proto3" json:"downloading_bytes,omitempty"`
+	QueuedFiles      int64 `protobuf:"varint,7,opt,name=queued_files,json=queuedFiles,proto3" json:"queued_files,omitempty"`
+	MissingFiles     int64 `protobuf:"varint,8,opt,name=missing_files,json=missingFiles,proto3" json:"missing_files,omitempty"`
+	FailedFiles      int64 `protobuf:"varint,9,opt,name=failed_files,json=failedFiles,proto3" json:"failed_files,omitempty"`
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache
 }
@@ -2421,15 +2430,16 @@ type ModelCacheStatus struct {
 	Name              string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
 	RequestedRevision string                 `protobuf:"bytes,3,opt,name=requested_revision,json=requestedRevision,proto3" json:"requested_revision,omitempty"`
 	Commit            string                 `protobuf:"bytes,4,opt,name=commit,proto3" json:"commit,omitempty"`
-	State             CacheState             `protobuf:"varint,9,opt,name=state,proto3,enum=matrixhub.v1alpha1.CacheState" json:"state,omitempty"`
-	Totals            *ModelCacheTotals      `protobuf:"bytes,5,opt,name=totals,proto3" json:"totals,omitempty"`
-	Files             []*ModelCacheFile      `protobuf:"bytes,6,rep,name=files,proto3" json:"files,omitempty"`
+	// How much of the selected files is cached; see CacheState.
+	State  CacheState        `protobuf:"varint,5,opt,name=state,proto3,enum=matrixhub.v1alpha1.CacheState" json:"state,omitempty"`
+	Totals *ModelCacheTotals `protobuf:"bytes,6,opt,name=totals,proto3" json:"totals,omitempty"`
+	Files  []*ModelCacheFile `protobuf:"bytes,7,rep,name=files,proto3" json:"files,omitempty"`
 	// The latest pull that the server knows of: of the requested selection for
 	// CacheModel, of the commit for GetModelCache. Unset when there is none, for
 	// example when no pull was started, the last one finished more than an hour
 	// ago, or the server restarted since.
-	Task          *ModelCacheTask `protobuf:"bytes,7,opt,name=task,proto3" json:"task,omitempty"`
-	Warnings      []string        `protobuf:"bytes,8,rep,name=warnings,proto3" json:"warnings,omitempty"`
+	Task          *ModelCacheTask `protobuf:"bytes,8,opt,name=task,proto3" json:"task,omitempty"`
+	Warnings      []string        `protobuf:"bytes,9,rep,name=warnings,proto3" json:"warnings,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2665,10 +2675,10 @@ const file_v1alpha1_model_proto_rawDesc = "" +
 	"\brevision\x18\x03 \x01(\tB\b\xfaB\x05r\x03\x18\xff\x01R\brevision\x128\n" +
 	"\x0eallow_patterns\x18\x04 \x03(\tB\x11\xfaB\x0e\x92\x01\v\x10\x10\"\ar\x05\x10\x01\x18\x80\x02R\rallowPatterns\x12:\n" +
 	"\x0fignore_patterns\x18\x05 \x03(\tB\x11\xfaB\x0e\x92\x01\v\x10\x10\"\ar\x05\x10\x01\x18\x80\x02R\x0eignorePatterns\x12\x17\n" +
-	"\adry_run\x18\x06 \x01(\bR\x06dryRun\"\x9f\x01\n" +
+	"\adry_run\x18\x06 \x01(\bR\x06dryRun\"\xc0\x01\n" +
 	"\x14GetModelCacheRequest\x12!\n" +
-	"\aproject\x18\x01 \x01(\tB\a\xfaB\x04r\x02\x10\x01R\aproject\x12>\n" +
-	"\x04name\x18\x02 \x01(\tB*\xfaB'r%\x10\x01Z\x06modelsZ\bdatasetsZ\x06spacesZ\aresolveR\x04name\x12$\n" +
+	"\aproject\x18\x01 \x01(\tB\a\xfaB\x04r\x02\x10\x01R\aproject\x12_\n" +
+	"\x04name\x18\x02 \x01(\tBK\xfaBHrF\x10\x01\x18\xfb\x012\x1c^[A-Za-z0-9][A-Za-z0-9_.-]*$Z\x06modelsZ\bdatasetsZ\x06spacesZ\aresolveR\x04name\x12$\n" +
 	"\brevision\x18\x03 \x01(\tB\b\xfaB\x05r\x03\x18\xff\x01R\brevision\"\xd7\x01\n" +
 	"\x0eModelCacheFile\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12\x12\n" +
@@ -2701,11 +2711,11 @@ const file_v1alpha1_model_proto_rawDesc = "" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12-\n" +
 	"\x12requested_revision\x18\x03 \x01(\tR\x11requestedRevision\x12\x16\n" +
 	"\x06commit\x18\x04 \x01(\tR\x06commit\x124\n" +
-	"\x05state\x18\t \x01(\x0e2\x1e.matrixhub.v1alpha1.CacheStateR\x05state\x12<\n" +
-	"\x06totals\x18\x05 \x01(\v2$.matrixhub.v1alpha1.ModelCacheTotalsR\x06totals\x128\n" +
-	"\x05files\x18\x06 \x03(\v2\".matrixhub.v1alpha1.ModelCacheFileR\x05files\x126\n" +
-	"\x04task\x18\a \x01(\v2\".matrixhub.v1alpha1.ModelCacheTaskR\x04task\x12\x1a\n" +
-	"\bwarnings\x18\b \x03(\tR\bwarnings*\x1d\n" +
+	"\x05state\x18\x05 \x01(\x0e2\x1e.matrixhub.v1alpha1.CacheStateR\x05state\x12<\n" +
+	"\x06totals\x18\x06 \x01(\v2$.matrixhub.v1alpha1.ModelCacheTotalsR\x06totals\x128\n" +
+	"\x05files\x18\a \x03(\v2\".matrixhub.v1alpha1.ModelCacheFileR\x05files\x126\n" +
+	"\x04task\x18\b \x01(\v2\".matrixhub.v1alpha1.ModelCacheTaskR\x04task\x12\x1a\n" +
+	"\bwarnings\x18\t \x03(\tR\bwarnings*\x1d\n" +
 	"\bFileType\x12\a\n" +
 	"\x03DIR\x10\x00\x12\b\n" +
 	"\x04FILE\x10\x01*G\n" +

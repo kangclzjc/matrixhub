@@ -17,6 +17,7 @@ package modelcache
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"slices"
 	"strings"
 
@@ -32,13 +33,15 @@ var weightExts = []string{
 type compiledSelection struct {
 	allow  []*glob
 	ignore []*glob
+	// maxSteps bounds the runes that matching compares for one plan.
+	maxSteps int
 }
 
 // selectAll selects every file of a revision.
 var selectAll = &compiledSelection{}
 
 func compileSelection(sel Selection) (*compiledSelection, error) {
-	c := &compiledSelection{}
+	c := &compiledSelection{maxSteps: maxMatchSteps}
 	for _, p := range sel.AllowPatterns {
 		g, err := compileGlob(p)
 		if err != nil {
@@ -68,17 +71,23 @@ type plan struct {
 }
 
 // plan applies the allow patterns (none means everything), then the ignore
-// patterns.
-func (c *compiledSelection) plan(files []git.RevisionFile) *plan {
+// patterns. It fails with ErrInvalidSelection when matching the patterns
+// against the files would take too long.
+func (c *compiledSelection) plan(files []git.RevisionFile) (*plan, error) {
 	sorted := slices.Clone(files)
 	slices.SortFunc(sorted, func(a, b git.RevisionFile) int { return strings.Compare(a.Path, b.Path) })
 
 	p := &plan{sizes: map[string]int64{}}
+	budget := &matchBudget{max: c.maxSteps}
 	hasWeights, selectedWeights := false, false
 	for _, f := range sorted {
 		weight := hasAnySuffix(f.Path, weightExts)
 		hasWeights = hasWeights || weight
-		if !c.selects(f.Path) {
+		selected := c.selects(f.Path, budget)
+		if budget.exceeded() {
+			return nil, fmt.Errorf("%w: the patterns are too expensive to match against the %d files of this revision", ErrInvalidSelection, len(files))
+		}
+		if !selected {
 			continue
 		}
 		selectedWeights = selectedWeights || weight
@@ -97,18 +106,18 @@ func (c *compiledSelection) plan(files []git.RevisionFile) *plan {
 	case hasWeights && !selectedWeights:
 		p.warnings = append(p.warnings, "the allow and ignore patterns exclude every weight file")
 	}
-	return p
+	return p, nil
 }
 
-func (c *compiledSelection) selects(path string) bool {
+func (c *compiledSelection) selects(path string, b *matchBudget) bool {
 	if len(c.allow) == 0 && len(c.ignore) == 0 {
 		return true
 	}
 	runes := []rune(path)
-	if len(c.allow) > 0 && !matchAny(c.allow, runes) {
+	if len(c.allow) > 0 && !matchAny(c.allow, runes, b) {
 		return false
 	}
-	return !matchAny(c.ignore, runes)
+	return !matchAny(c.ignore, runes, b)
 }
 
 func hasAnySuffix(p string, suffixes []string) bool {
@@ -120,9 +129,9 @@ func hasAnySuffix(p string, suffixes []string) bool {
 	return false
 }
 
-func matchAny(globs []*glob, path []rune) bool {
+func matchAny(globs []*glob, path []rune, b *matchBudget) bool {
 	for _, g := range globs {
-		if g.match(path) {
+		if g.match(path, b) {
 			return true
 		}
 	}

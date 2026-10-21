@@ -25,10 +25,16 @@ import (
 	"github.com/matrixhub-ai/matrixhub/internal/infra/log"
 )
 
+// Errors of an object. A status shows them to everyone who can read the
+// model, so they never carry errors of other layers, which may name server
+// paths; see publicError.
 var (
 	errNotQueued      = errors.New("object is not queued for download after refreshing the model from upstream")
 	errDownloadFailed = errors.New("download failed; see server logs for details")
 	errStalled        = errors.New("download made no progress")
+	errNotStored      = errors.New("download finished but was not stored; a client may still be reading it")
+	errModelGone      = errors.New("the model was deleted")
+	errResyncFailed   = errors.New("refreshing the model from upstream failed; see server logs for details")
 )
 
 type objectState struct {
@@ -201,18 +207,20 @@ func (s *Service) fetchWithRetry(t *task, oid string) {
 			})
 			return
 		}
-		// The mirror cannot cancel a stalled download, and a retry would
-		// attach to the same download, so a stall ends the object.
-		if s.ctx.Err() != nil || attempt == s.opts.MaxAttempts || errors.Is(err, errStalled) {
+		// The mirror cannot cancel a download, and a retry would attach to
+		// the same download, so a stalled or unstored download ends the
+		// object; so does a deleted model.
+		if s.ctx.Err() != nil || attempt == s.opts.MaxAttempts ||
+			errors.Is(err, errStalled) || errors.Is(err, errNotStored) || errors.Is(err, errModelGone) {
 			log.Warnf("model cache: object %s of %s/%s failed after %d attempts: %v", oid, t.project, t.name, attempt, err)
 			t.update(oid, func(o *objectState) {
-				o.state, o.err = FileFailed, err.Error()
+				o.state, o.err = FileFailed, publicError(err)
 			})
 			return
 		}
 		backoff := s.opts.RetryBackoff << (attempt - 1)
 		t.update(oid, func(o *objectState) {
-			o.err = fmt.Sprintf("attempt %d/%d failed: %v; retrying in %s", attempt, s.opts.MaxAttempts, err, backoff)
+			o.err = fmt.Sprintf("attempt %d/%d failed: %s; retrying in %s", attempt, s.opts.MaxAttempts, publicError(err), backoff)
 		})
 		if !sleepCtx(s.ctx, backoff) {
 			t.update(oid, func(o *objectState) {
@@ -256,6 +264,7 @@ func (s *Service) waitStored(t *task, oid string) error {
 
 	last := int64(-1)
 	lastChange := s.opts.Now()
+	var complete time.Time
 	for {
 		if s.git.LFSObjectExists(s.ctx, oid) {
 			return nil
@@ -269,13 +278,24 @@ func (s *Service) waitStored(t *task, oid string) error {
 		}
 		downloaded := d.Downloaded()
 		t.update(oid, func(o *objectState) { o.downloaded = downloaded })
-		// A complete download waits for readers to close before it is
-		// stored; that is not a stall.
-		if downloaded != last || downloaded >= d.Total() {
+		now := s.opts.Now()
+		switch {
+		case downloaded >= d.Total():
+			// A complete download is stored once its readers close. That
+			// is not a stall, but a reader that never closes must not keep
+			// the task running forever.
+			if complete.IsZero() {
+				complete = now
+			}
+			if now.Sub(complete) > s.opts.StoreTimeout {
+				return errNotStored
+			}
+			lastChange = now
+		case downloaded != last:
 			last = downloaded
-			lastChange = s.opts.Now()
+			lastChange = now
 		}
-		if s.opts.StallTimeout > 0 && s.opts.Now().Sub(lastChange) > s.opts.StallTimeout {
+		if s.opts.StallTimeout > 0 && now.Sub(lastChange) > s.opts.StallTimeout {
 			return fmt.Errorf("%w for %s", errStalled, s.opts.StallTimeout)
 		}
 		select {
@@ -286,29 +306,61 @@ func (s *Service) waitStored(t *task, oid string) error {
 	}
 }
 
+// requeueResult is the outcome of the last forced sync of a model.
+type requeueResult struct {
+	at  time.Time
+	err error
+}
+
 // requeue forces a sync of the model so the mirror queues its missing objects
 // again. Concurrent calls for one model are merged and rate limited, because
-// one sync re-queues every missing object of the repository.
+// one sync re-queues every missing object of the repository; a call within
+// the interval gets the result of the last sync.
 func (s *Service) requeue(project, name string) error {
 	key := project + "/" + name
 	_, err, _ := s.requeueGroup.Do(key, func() (any, error) {
 		s.mu.Lock()
 		last, ok := s.lastRequeue[key]
 		s.mu.Unlock()
-		if ok && s.opts.Now().Sub(last) < s.opts.RequeueMinInterval {
-			return nil, nil
+		if ok && s.opts.Now().Sub(last.at) < s.opts.RequeueMinInterval {
+			return nil, last.err
 		}
-		// A deleted model must not be re-created by the sync.
-		if _, err := s.models.GetModel(s.ctx, project, name); err != nil {
-			return nil, fmt.Errorf("model %s/%s is no longer available: %w", project, name, err)
+		start := s.opts.Now()
+		ctx, cancel := context.WithTimeout(s.ctx, s.opts.RefreshTimeout)
+		defer cancel()
+		// RefreshFromRemote never creates the model, so a deleted model
+		// stays deleted.
+		err := s.models.RefreshFromRemote(ctx, project, name)
+		switch {
+		case err == nil:
+		case isNotFound(err):
+			err = errModelGone
+		default:
+			log.Warnf("model cache: refresh of %s/%s from upstream failed: %v", project, name, err)
+			err = fmt.Errorf("%w: %w", errResyncFailed, err)
 		}
-		err := s.models.RefreshFromRemote(s.ctx, project, name)
 		s.mu.Lock()
-		s.lastRequeue[key] = s.opts.Now()
+		s.lastRequeue[key] = requeueResult{at: start, err: err}
 		s.mu.Unlock()
 		return nil, err
 	})
 	return err
+}
+
+// publicError returns the message that a status shows for err.
+func publicError(err error) string {
+	switch {
+	case errors.Is(err, errStalled):
+		return err.Error()
+	case errors.Is(err, context.Canceled):
+		return "interrupted: server shutting down"
+	}
+	for _, known := range []error{errResyncFailed, errModelGone, errNotQueued, errNotStored, errDownloadFailed} {
+		if errors.Is(err, known) {
+			return known.Error()
+		}
+	}
+	return errDownloadFailed.Error()
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) bool {

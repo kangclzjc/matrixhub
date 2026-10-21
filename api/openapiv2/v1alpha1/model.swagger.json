@@ -614,16 +614,18 @@
           "items": {
             "type": "string"
           },
-          "description": "Narrow the cached files; without patterns every file of the revision is\ncached. huggingface_hub fnmatch semantics: '*' and '?' also match '/', and\na trailing '/' selects a whole directory. A pattern holds at most 16\nwildcards ('*', '?' and classes)."
+          "description": "Narrow the cached files; without patterns every file of the revision is\ncached. Patterns follow huggingface_hub fnmatch semantics: '*' and '?'\nalso match '/', and a trailing '/' selects a whole directory. A list\nholds at most 16 patterns, and a pattern at most 256 characters and 16\nwildcards ('*', '?' and classes)."
         },
         "ignorePatterns": {
           "type": "array",
           "items": {
             "type": "string"
-          }
+          },
+          "description": "Files that match an ignore pattern are not cached, even when they match\nan allow pattern. Same syntax and limits as allow_patterns."
         },
         "dryRun": {
-          "type": "boolean"
+          "type": "boolean",
+          "description": "Only report what a pull would do: the upstream files of the revision and\nwhich of them are cached. A dry run creates nothing and downloads\nnothing."
         }
       }
     },
@@ -1002,7 +1004,8 @@
           "type": "string"
         },
         "state": {
-          "$ref": "#/definitions/v1alpha1CacheState"
+          "$ref": "#/definitions/v1alpha1CacheState",
+          "description": "How much of the selected files is cached; see CacheState."
         },
         "totals": {
           "$ref": "#/definitions/v1alpha1ModelCacheTotals"
@@ -1057,7 +1060,8 @@
         },
         "bytes": {
           "type": "string",
-          "format": "int64"
+          "format": "int64",
+          "description": "Total size of the files."
         },
         "cachedFiles": {
           "type": "string",
@@ -1073,7 +1077,8 @@
         },
         "downloadingBytes": {
           "type": "string",
-          "format": "int64"
+          "format": "int64",
+          "description": "Bytes downloaded so far of the files in DOWNLOADING state, not their\nsize."
         },
         "queuedFiles": {
           "type": "string",

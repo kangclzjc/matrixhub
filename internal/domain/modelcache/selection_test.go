@@ -70,7 +70,7 @@ func TestGlob(t *testing.T) {
 		t.Run(tt.pattern+"~"+tt.path, func(t *testing.T) {
 			g, err := compileGlob(tt.pattern)
 			require.NoError(t, err)
-			require.Equal(t, tt.want, g.match([]rune(tt.path)))
+			require.Equal(t, tt.want, g.match([]rune(tt.path), &matchBudget{max: maxMatchSteps}))
 		})
 	}
 }
@@ -101,8 +101,37 @@ func TestPlanStaysCheapWithPathologicalPatterns(t *testing.T) {
 	}
 
 	start := time.Now()
-	sel.plan(files)
+	_, err = sel.plan(files)
+	require.NoError(t, err)
 	require.Less(t, time.Since(start), 2*time.Second)
+}
+
+// Long literal segments make finding a segment cost the path length times
+// the segment length, so such patterns against long paths exhaust the budget.
+func TestPlanFailsWhenMatchingIsTooExpensive(t *testing.T) {
+	var allow []string
+	for i := 0; i < 16; i++ {
+		allow = append(allow, "*"+strings.Repeat("a", 100)+"b*")
+	}
+	sel, err := compileSelection(Selection{AllowPatterns: allow})
+	require.NoError(t, err)
+	sel.maxSteps = 10_000_000
+	files := make([]git.RevisionFile, 1000)
+	for i := range files {
+		files[i] = git.RevisionFile{Path: fmt.Sprintf("%05d", i) + strings.Repeat("a", 1000)}
+	}
+
+	start := time.Now()
+	_, err = sel.plan(files)
+	require.ErrorIs(t, err, ErrInvalidSelection)
+	require.Less(t, time.Since(start), 2*time.Second)
+
+	// The same patterns are cheap on paths without long runs of 'a'.
+	for i := range files {
+		files[i].Path = fmt.Sprintf("%05d/", i) + strings.Repeat("model/", 30) + "model.safetensors"
+	}
+	_, err = sel.plan(files)
+	require.NoError(t, err)
 }
 
 func paths(files []git.RevisionFile) []string {
@@ -121,13 +150,14 @@ func TestPlanSelectsEveryFileByDefault(t *testing.T) {
 	sel, err := compileSelection(Selection{})
 	require.NoError(t, err)
 
-	p := sel.plan([]git.RevisionFile{
+	p, err := sel.plan([]git.RevisionFile{
 		{Path: "config.json", Size: 10},
 		lfs("model.safetensors", "a", 100),
 		lfs("original/consolidated.00.pth", "b", 100),
 		lfs("onnx/model.onnx", "c", 100),
 		lfs("model-q4.gguf", "d", 100),
 	})
+	require.NoError(t, err)
 
 	require.Equal(t, []string{"config.json", "model-q4.gguf", "model.safetensors", "onnx/model.onnx", "original/consolidated.00.pth"}, paths(p.files))
 	require.Equal(t, []string{"d", "a", "c", "b"}, p.objects)
@@ -142,13 +172,14 @@ func TestPlanAppliesPatterns(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	p := sel.plan([]git.RevisionFile{
+	p, err := sel.plan([]git.RevisionFile{
 		{Path: "README.md"},
 		{Path: "config.json"},
 		lfs("model-00001-of-00002.safetensors", "a", 1),
 		lfs("model-00002-of-00002.safetensors", "b", 1),
 		lfs("original/consolidated.00.pth", "c", 1),
 	})
+	require.NoError(t, err)
 
 	require.Equal(t, []string{"config.json", "model-00001-of-00002.safetensors"}, paths(p.files))
 }
@@ -157,7 +188,8 @@ func TestPlanWarnsWhenNoWeightIsSelected(t *testing.T) {
 	sel, err := compileSelection(Selection{AllowPatterns: []string{"*.md"}})
 	require.NoError(t, err)
 
-	p := sel.plan([]git.RevisionFile{{Path: "README.md"}, lfs("model-q4_k_m.gguf", "a", 1)})
+	p, err := sel.plan([]git.RevisionFile{{Path: "README.md"}, lfs("model-q4_k_m.gguf", "a", 1)})
+	require.NoError(t, err)
 
 	require.Equal(t, []string{"README.md"}, paths(p.files))
 	require.Len(t, p.warnings, 1)
@@ -167,7 +199,8 @@ func TestPlanWarnsWhenNothingIsSelected(t *testing.T) {
 	sel, err := compileSelection(Selection{AllowPatterns: []string{"*.nothing"}})
 	require.NoError(t, err)
 
-	p := sel.plan([]git.RevisionFile{{Path: "README.md"}})
+	p, err := sel.plan([]git.RevisionFile{{Path: "README.md"}})
+	require.NoError(t, err)
 
 	require.Empty(t, p.files)
 	require.Len(t, p.warnings, 1)
@@ -177,7 +210,8 @@ func TestPlanDeduplicatesObjects(t *testing.T) {
 	sel, err := compileSelection(Selection{})
 	require.NoError(t, err)
 
-	p := sel.plan([]git.RevisionFile{lfs("a/model.safetensors", "x", 1), lfs("b/model.safetensors", "x", 1)})
+	p, err := sel.plan([]git.RevisionFile{lfs("a/model.safetensors", "x", 1), lfs("b/model.safetensors", "x", 1)})
+	require.NoError(t, err)
 
 	require.Len(t, p.files, 2)
 	require.Equal(t, []string{"x"}, p.objects)

@@ -23,139 +23,131 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	modelv1alpha1 "github.com/matrixhub-ai/matrixhub/api/go/v1alpha1"
-	"github.com/matrixhub-ai/matrixhub/internal/domain/authz"
+	authzmocks "github.com/matrixhub-ai/matrixhub/internal/domain/authz/mocks"
 	"github.com/matrixhub-ai/matrixhub/internal/domain/modelcache"
+	modelcachemocks "github.com/matrixhub-ai/matrixhub/internal/domain/modelcache/mocks"
 	"github.com/matrixhub-ai/matrixhub/internal/domain/role"
 )
 
-// fakeAuthz grants the permissions in allowed and records the checked ones.
-type fakeAuthz struct {
-	authz.IAuthzService
-	allowed map[role.Permission]bool
-	checked []role.Permission
+// cacheHandlerFixture holds strict mocks: a permission check or a cache call
+// that a test does not expect fails it.
+type cacheHandlerFixture struct {
+	handler *ModelHandler
+	authz   *authzmocks.MockIAuthzService
+	cache   *modelcachemocks.MockIModelCacheService
 }
 
-func (a *fakeAuthz) VerifyProjectPermissionByName(_ context.Context, _ string, perm role.Permission) (bool, error) {
-	a.checked = append(a.checked, perm)
-	return a.allowed[perm], nil
-}
-
-type fakeModelCache struct {
-	modelcache.IModelCacheService
-	status *modelcache.CacheStatus
-	err    error
-	calls  int
-	req    *modelcache.Request
-}
-
-func (c *fakeModelCache) CacheModel(_ context.Context, req *modelcache.Request) (*modelcache.CacheStatus, error) {
-	c.calls++
-	c.req = req
-	return c.status, c.err
-}
-
-func (c *fakeModelCache) GetModelCache(context.Context, string, string, string) (*modelcache.CacheStatus, error) {
-	c.calls++
-	return c.status, c.err
-}
-
-func newCacheHandler(allowed ...role.Permission) (*ModelHandler, *fakeAuthz, *fakeModelCache) {
-	az := &fakeAuthz{allowed: map[role.Permission]bool{}}
-	for _, perm := range allowed {
-		az.allowed[perm] = true
+func newCacheHandler(t *testing.T) *cacheHandlerFixture {
+	ctrl := gomock.NewController(t)
+	f := &cacheHandlerFixture{
+		authz: authzmocks.NewMockIAuthzService(ctrl),
+		cache: modelcachemocks.NewMockIModelCacheService(ctrl),
 	}
-	cache := &fakeModelCache{status: &modelcache.CacheStatus{Project: "proj", Name: "model", State: modelcache.CacheStateMissing}}
-	return &ModelHandler{cache: cache, authzService: az}, az, cache
+	f.handler = &ModelHandler{cache: f.cache, authzService: f.authz}
+	return f
 }
 
-func requireCode(t *testing.T, err error, want codes.Code) {
-	t.Helper()
-	if status.Code(err) != want {
-		t.Fatalf("status code = %s, want %s (err: %v)", status.Code(err), want, err)
-	}
+// expectPermission expects one check of perm on project "proj".
+func (f *cacheHandlerFixture) expectPermission(perm role.Permission, allowed bool) {
+	f.authz.EXPECT().VerifyProjectPermissionByName(gomock.Any(), "proj", perm).Return(allowed, nil)
 }
+
+var missingStatus = &modelcache.CacheStatus{Project: "proj", Name: "model", State: modelcache.CacheStateMissing}
 
 func TestCacheModelNeedsPushPermission(t *testing.T) {
 	for _, dryRun := range []bool{true, false} {
 		t.Run(fmt.Sprintf("dryRun=%v", dryRun), func(t *testing.T) {
-			h, az, cache := newCacheHandler(role.ModelGet, role.ModelPull)
+			f := newCacheHandler(t)
+			f.expectPermission(role.ModelPush, false)
 
-			_, err := h.CacheModel(t.Context(), &modelv1alpha1.CacheModelRequest{Project: "proj", Name: "model", DryRun: dryRun})
+			_, err := f.handler.CacheModel(t.Context(), &modelv1alpha1.CacheModelRequest{Project: "proj", Name: "model", DryRun: dryRun})
 
-			requireCode(t, err, codes.PermissionDenied)
-			if len(az.checked) != 1 || az.checked[0] != role.ModelPush {
-				t.Fatalf("checked permissions = %v, want [%s]", az.checked, role.ModelPush)
-			}
-			if cache.calls != 0 {
-				t.Fatalf("cache called %d times without permission", cache.calls)
-			}
+			require.Equal(t, codes.PermissionDenied, status.Code(err))
 		})
 	}
 }
 
 func TestCacheModelPassesTheRequest(t *testing.T) {
-	h, _, cache := newCacheHandler(role.ModelPush)
+	f := newCacheHandler(t)
+	f.expectPermission(role.ModelPush, true)
+	f.cache.EXPECT().CacheModel(gomock.Any(), &modelcache.Request{
+		Project:  "proj",
+		Name:     "model",
+		Revision: "main",
+		Selection: modelcache.Selection{
+			AllowPatterns:  []string{"*.safetensors"},
+			IgnorePatterns: []string{"original/"},
+		},
+		DryRun: true,
+	}).Return(missingStatus, nil)
 
-	_, err := h.CacheModel(t.Context(), &modelv1alpha1.CacheModelRequest{
-		Project:       "proj",
-		Name:          "model",
-		Revision:      "main",
-		AllowPatterns: []string{"*.safetensors"},
-		DryRun:        true,
+	st, err := f.handler.CacheModel(t.Context(), &modelv1alpha1.CacheModelRequest{
+		Project:        "proj",
+		Name:           "model",
+		Revision:       "main",
+		AllowPatterns:  []string{"*.safetensors"},
+		IgnorePatterns: []string{"original/"},
+		DryRun:         true,
 	})
 
-	if err != nil {
-		t.Fatalf("CacheModel() error = %v", err)
-	}
-	if cache.req.Revision != "main" || !cache.req.DryRun || len(cache.req.Selection.AllowPatterns) != 1 {
-		t.Fatalf("request = %+v", cache.req)
-	}
+	require.NoError(t, err)
+	require.Equal(t, modelv1alpha1.CacheState_CACHE_STATE_MISSING, st.GetState())
 }
 
 func TestGetModelCacheNeedsGetPermission(t *testing.T) {
-	h, az, cache := newCacheHandler()
+	f := newCacheHandler(t)
+	f.expectPermission(role.ModelGet, false)
 
-	_, err := h.GetModelCache(t.Context(), &modelv1alpha1.GetModelCacheRequest{Project: "proj", Name: "model"})
+	_, err := f.handler.GetModelCache(t.Context(), &modelv1alpha1.GetModelCacheRequest{Project: "proj", Name: "model"})
 
-	requireCode(t, err, codes.PermissionDenied)
-	if len(az.checked) != 1 || az.checked[0] != role.ModelGet {
-		t.Fatalf("checked permissions = %v, want [%s]", az.checked, role.ModelGet)
-	}
-	if cache.calls != 0 {
-		t.Fatalf("cache called %d times without permission", cache.calls)
-	}
-
-	h, _, _ = newCacheHandler(role.ModelGet)
-	if _, err := h.GetModelCache(t.Context(), &modelv1alpha1.GetModelCacheRequest{Project: "proj", Name: "model"}); err != nil {
-		t.Fatalf("GetModelCache() error = %v", err)
-	}
+	require.Equal(t, codes.PermissionDenied, status.Code(err))
 }
 
-func TestCacheModelBoundsPatterns(t *testing.T) {
-	tests := map[string]*modelv1alpha1.CacheModelRequest{
+func TestGetModelCachePassesTheRequest(t *testing.T) {
+	f := newCacheHandler(t)
+	f.expectPermission(role.ModelGet, true)
+	f.cache.EXPECT().GetModelCache(gomock.Any(), "proj", "model", "v1").Return(missingStatus, nil)
+
+	_, err := f.handler.GetModelCache(t.Context(), &modelv1alpha1.GetModelCacheRequest{Project: "proj", Name: "model", Revision: "v1"})
+
+	require.NoError(t, err)
+}
+
+func TestModelCacheHandlersRejectInvalidRequests(t *testing.T) {
+	// Validation comes first: no permission check and no cache call.
+	cacheRequests := map[string]*modelv1alpha1.CacheModelRequest{
 		"too many patterns": {Project: "proj", Name: "model", IgnorePatterns: slices.Repeat([]string{"*.bin"}, 17)},
 		"pattern too long":  {Project: "proj", Name: "model", AllowPatterns: []string{strings.Repeat("a", 257)}},
 		"invalid name":      {Project: "proj", Name: "../model"},
 	}
-	for name, req := range tests {
-		t.Run(name, func(t *testing.T) {
-			h, _, cache := newCacheHandler(role.ModelPush)
+	for name, req := range cacheRequests {
+		t.Run("CacheModel "+name, func(t *testing.T) {
+			_, err := newCacheHandler(t).handler.CacheModel(t.Context(), req)
 
-			_, err := h.CacheModel(t.Context(), req)
+			require.Equal(t, codes.InvalidArgument, status.Code(err))
+		})
+	}
+	getRequests := map[string]*modelv1alpha1.GetModelCacheRequest{
+		"invalid name":      {Project: "proj", Name: "../model"},
+		"revision too long": {Project: "proj", Name: "model", Revision: strings.Repeat("a", 256)},
+	}
+	for name, req := range getRequests {
+		t.Run("GetModelCache "+name, func(t *testing.T) {
+			_, err := newCacheHandler(t).handler.GetModelCache(t.Context(), req)
 
-			requireCode(t, err, codes.InvalidArgument)
-			if cache.calls != 0 {
-				t.Fatalf("cache called for an invalid request")
-			}
+			require.Equal(t, codes.InvalidArgument, status.Code(err))
 		})
 	}
 }
 
-func TestModelCacheErrorToStatus(t *testing.T) {
+func TestModelCacheHandlersMapErrors(t *testing.T) {
 	// Errors from local storage and syncs can name server paths.
 	storageErr := errors.New("repository does not exist at /data/repositories/proj/model.git")
 	tests := []struct {
@@ -166,47 +158,111 @@ func TestModelCacheErrorToStatus(t *testing.T) {
 		{fmt.Errorf("%w: refs/pr/1", modelcache.ErrUnsupportedRevision), codes.InvalidArgument},
 		{fmt.Errorf("%w: proj/model", modelcache.ErrModelNotFound), codes.NotFound},
 		{fmt.Errorf("%w: %w", modelcache.ErrRevisionNotFound, storageErr), codes.NotFound},
-		{fmt.Errorf("%w: %w", modelcache.ErrUpstreamSync, storageErr), codes.FailedPrecondition},
+		{fmt.Errorf("%w: %w", modelcache.ErrUpstreamSync, storageErr), codes.Unavailable},
 		{fmt.Errorf("%w: c9 resolves to c9 upstream", modelcache.ErrRevisionNotMirrored), codes.FailedPrecondition},
 		{fmt.Errorf("%w: proj", modelcache.ErrNotProxyProject), codes.FailedPrecondition},
 		{fmt.Errorf("%w: gated", modelcache.ErrUpstreamAccessDenied), codes.FailedPrecondition},
 		{fmt.Errorf("%w: rate limited", modelcache.ErrUpstreamUnavailable), codes.Unavailable},
+		// An upstream timeout is not the request's deadline.
+		{fmt.Errorf("%w: %w", modelcache.ErrUpstreamUnavailable, context.DeadlineExceeded), codes.Unavailable},
 		{modelcache.ErrClosed, codes.Unavailable},
 		{fmt.Errorf("%w: 8 running", modelcache.ErrTooManyTasks), codes.ResourceExhausted},
-		{fmt.Errorf("list files: %w", context.Canceled), codes.Canceled},
-		{fmt.Errorf("list files: %w", context.DeadlineExceeded), codes.DeadlineExceeded},
 		{storageErr, codes.Internal},
 	}
 	for _, tt := range tests {
-		t.Run(tt.err.Error(), func(t *testing.T) {
-			err := modelCacheErrorToStatus(tt.err)
+		t.Run("CacheModel "+tt.err.Error(), func(t *testing.T) {
+			f := newCacheHandler(t)
+			f.expectPermission(role.ModelPush, true)
+			f.cache.EXPECT().CacheModel(gomock.Any(), gomock.Any()).Return(nil, tt.err)
 
-			requireCode(t, err, tt.want)
-			if msg := status.Convert(err).Message(); strings.Contains(msg, "/data/") {
-				t.Fatalf("message %q leaks a server path", msg)
-			}
+			_, err := f.handler.CacheModel(t.Context(), &modelv1alpha1.CacheModelRequest{Project: "proj", Name: "model"})
+
+			requireStatus(t, err, tt.want)
+		})
+		t.Run("GetModelCache "+tt.err.Error(), func(t *testing.T) {
+			f := newCacheHandler(t)
+			f.expectPermission(role.ModelGet, true)
+			f.cache.EXPECT().GetModelCache(gomock.Any(), "proj", "model", "").Return(nil, tt.err)
+
+			_, err := f.handler.GetModelCache(t.Context(), &modelv1alpha1.GetModelCacheRequest{Project: "proj", Name: "model"})
+
+			requireStatus(t, err, tt.want)
 		})
 	}
 }
 
+func TestCacheModelReportsAnEndedRequest(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	f := newCacheHandler(t)
+	f.expectPermission(role.ModelPush, true)
+	f.cache.EXPECT().CacheModel(gomock.Any(), gomock.Any()).
+		Return(nil, fmt.Errorf("%w: %w", modelcache.ErrUpstreamUnavailable, context.Canceled))
+
+	_, err := f.handler.CacheModel(ctx, &modelv1alpha1.CacheModelRequest{Project: "proj", Name: "model"})
+
+	require.Equal(t, codes.Canceled, status.Code(err))
+}
+
+func requireStatus(t *testing.T, err error, want codes.Code) {
+	t.Helper()
+	require.Equal(t, want, status.Code(err), "err: %v", err)
+	require.NotContains(t, status.Convert(err).Message(), "/data/")
+}
+
 func TestModelCacheStatusToProto(t *testing.T) {
 	started := time.Date(2026, 10, 15, 8, 0, 0, 0, time.UTC)
-	st := modelCacheStatusToProto(&modelcache.CacheStatus{
-		Project: "proj",
-		Name:    "model",
-		State:   modelcache.CacheStatePartial,
-		Task:    &modelcache.TaskStatus{ID: "run-1", State: modelcache.TaskRunning, StartedAt: started},
+	finished := started.Add(time.Minute)
+
+	got := modelCacheStatusToProto(&modelcache.CacheStatus{
+		Project:           "proj",
+		Name:              "model",
+		RequestedRevision: "main",
+		Commit:            "c1",
+		State:             modelcache.CacheStatePartial,
+		Totals: modelcache.Totals{
+			Files: 9, Bytes: 8, CachedFiles: 7, CachedBytes: 6, DownloadingFiles: 5,
+			DownloadingBytes: 4, QueuedFiles: 3, MissingFiles: 2, FailedFiles: 1,
+		},
+		Files: []modelcache.FileStatus{
+			{Path: "config.json", Size: 10, State: modelcache.FileCached},
+			{Path: "a.safetensors", Size: 100, IsLFS: true, OID: "oa", State: modelcache.FileDownloading, DownloadedBytes: 40},
+			{Path: "b.safetensors", Size: 100, IsLFS: true, OID: "ob", State: modelcache.FileQueued},
+			{Path: "c.safetensors", Size: 100, IsLFS: true, OID: "oc", State: modelcache.FileMissing},
+			{Path: "d.safetensors", Size: 100, IsLFS: true, OID: "od", State: modelcache.FileFailed, Error: "download failed"},
+		},
+		Task:     &modelcache.TaskStatus{ID: "run-1", State: modelcache.TaskFailed, StartedAt: started, FinishedAt: &finished, Error: "1 of 4 files failed"},
+		Warnings: []string{"the selection matched no files"},
 	})
 
-	if st.State != modelv1alpha1.CacheState_CACHE_STATE_PARTIAL {
-		t.Fatalf("state = %s", st.State)
+	want := &modelv1alpha1.ModelCacheStatus{
+		Project:           "proj",
+		Name:              "model",
+		RequestedRevision: "main",
+		Commit:            "c1",
+		State:             modelv1alpha1.CacheState_CACHE_STATE_PARTIAL,
+		Totals: &modelv1alpha1.ModelCacheTotals{
+			Files: 9, Bytes: 8, CachedFiles: 7, CachedBytes: 6, DownloadingFiles: 5,
+			DownloadingBytes: 4, QueuedFiles: 3, MissingFiles: 2, FailedFiles: 1,
+		},
+		Files: []*modelv1alpha1.ModelCacheFile{
+			{Path: "config.json", Size: 10, State: modelv1alpha1.CacheFileState_CACHE_FILE_STATE_CACHED},
+			{Path: "a.safetensors", Size: 100, Lfs: true, Oid: "oa", State: modelv1alpha1.CacheFileState_CACHE_FILE_STATE_DOWNLOADING, DownloadedBytes: 40},
+			{Path: "b.safetensors", Size: 100, Lfs: true, Oid: "ob", State: modelv1alpha1.CacheFileState_CACHE_FILE_STATE_QUEUED},
+			{Path: "c.safetensors", Size: 100, Lfs: true, Oid: "oc", State: modelv1alpha1.CacheFileState_CACHE_FILE_STATE_MISSING},
+			{Path: "d.safetensors", Size: 100, Lfs: true, Oid: "od", State: modelv1alpha1.CacheFileState_CACHE_FILE_STATE_FAILED, Error: "download failed"},
+		},
+		Task: &modelv1alpha1.ModelCacheTask{
+			Id:         "run-1",
+			State:      modelv1alpha1.CacheTaskState_CACHE_TASK_STATE_FAILED,
+			StartedAt:  "2026-10-15T08:00:00Z",
+			FinishedAt: "2026-10-15T08:01:00Z",
+			Error:      "1 of 4 files failed",
+		},
+		Warnings: []string{"the selection matched no files"},
 	}
-	if st.Task.GetId() != "run-1" || st.Task.GetState() != modelv1alpha1.CacheTaskState_CACHE_TASK_STATE_RUNNING ||
-		st.Task.GetStartedAt() != "2026-10-15T08:00:00Z" || st.Task.GetFinishedAt() != "" {
-		t.Fatalf("task = %+v", st.Task)
-	}
+	require.True(t, proto.Equal(want, got), "got %v", got)
 
-	if st := modelCacheStatusToProto(&modelcache.CacheStatus{State: modelcache.CacheStateCached}); st.Task != nil {
-		t.Fatalf("task = %+v, want unset without a run", st.Task)
-	}
+	// Without a run the task is unset.
+	require.Nil(t, modelCacheStatusToProto(&modelcache.CacheStatus{State: modelcache.CacheStateCached}).GetTask())
 }

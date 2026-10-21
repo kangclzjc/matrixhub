@@ -140,6 +140,8 @@ var (
 )
 
 // IModelCacheService caches proxy-project models from upstream on the server.
+//
+//go:generate go tool mockgen -source=modelcache.go -destination=mocks/modelcache_mock.go -package=mocks
 type IModelCacheService interface {
 	// CacheModel starts, or attaches to, the task that pulls the selected
 	// files of a revision into local storage. With DryRun it is read-only.
@@ -172,6 +174,11 @@ type Options struct {
 	// RequeueMinInterval rate-limits the forced re-syncs that re-queue
 	// objects of one model.
 	RequeueMinInterval time.Duration
+	// RefreshTimeout bounds one forced re-sync of a model.
+	RefreshTimeout time.Duration
+	// StoreTimeout fails an object whose download finished but is not
+	// stored this long after, because a client still reads it.
+	StoreTimeout time.Duration
 	// FinishedTaskTTL is how long finished tasks are kept for status reports.
 	FinishedTaskTTL time.Duration
 	// Now returns the current time; tests may replace it.
@@ -204,6 +211,12 @@ func (o Options) withDefaults() Options {
 	}
 	if o.RequeueMinInterval <= 0 {
 		o.RequeueMinInterval = 5 * time.Second
+	}
+	if o.RefreshTimeout <= 0 {
+		o.RefreshTimeout = 10 * time.Minute
+	}
+	if o.StoreTimeout <= 0 {
+		o.StoreTimeout = time.Hour
 	}
 	if o.FinishedTaskTTL <= 0 {
 		o.FinishedTaskTTL = time.Hour

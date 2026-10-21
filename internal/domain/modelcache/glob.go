@@ -21,10 +21,21 @@ import (
 )
 
 // maxPatternWildcards bounds the wildcards ('*', '?' and classes) of one
-// pattern. Finding a segment costs up to the path length times the wildcards
-// it starts with, so the bound keeps selections cheap on repositories with
-// many long paths.
+// pattern.
 const maxPatternWildcards = 16
+
+// maxMatchSteps bounds the runes that matching compares for one plan, about a
+// second of work. Finding a segment costs up to the path length times the
+// segment length, so long literal patterns against many long paths could
+// otherwise keep the server busy for minutes.
+const maxMatchSteps = 500_000_000
+
+// matchBudget counts the runes that matching compares.
+type matchBudget struct {
+	steps, max int
+}
+
+func (b *matchBudget) exceeded() bool { return b.steps > b.max }
 
 // glob matches a path against a pattern with huggingface_hub semantics:
 // fnmatch rules where '*' and '?' also match '/', and a trailing '/' selects a
@@ -156,21 +167,23 @@ func parseClass(body []rune) (runeMatcher, error) {
 	return m, nil
 }
 
-func (g *glob) match(path []rune) bool {
+// match reports whether path matches the pattern. It charges the runes it
+// compares to b and gives up, returning false, once b is exceeded.
+func (g *glob) match(path []rune, b *matchBudget) bool {
 	if len(g.segments) == 1 {
-		return len(path) == len(g.segments[0]) && matchAt(g.segments[0], path, 0)
+		return len(path) == len(g.segments[0]) && matchAt(g.segments[0], path, 0, b)
 	}
 	first, last := g.segments[0], g.segments[len(g.segments)-1]
 	if len(first)+len(last) > len(path) ||
-		!matchAt(first, path, 0) ||
-		!matchAt(last, path, len(path)-len(last)) {
+		!matchAt(first, path, 0, b) ||
+		!matchAt(last, path, len(path)-len(last), b) {
 		return false
 	}
 	// Placing each middle segment as early as possible leaves the most room
 	// for the segments after it.
 	pos, end := len(first), len(path)-len(last)
 	for _, seg := range g.segments[1 : len(g.segments)-1] {
-		i := find(seg, path[:end], pos)
+		i := find(seg, path[:end], pos, b)
 		if i < 0 {
 			return false
 		}
@@ -179,19 +192,21 @@ func (g *glob) match(path []rune) bool {
 	return true
 }
 
-func matchAt(seg []runeMatcher, path []rune, at int) bool {
+func matchAt(seg []runeMatcher, path []rune, at int, b *matchBudget) bool {
 	for i := range seg {
 		if !seg[i].match(path[at+i]) {
+			b.steps += i + 1
 			return false
 		}
 	}
+	b.steps += len(seg)
 	return true
 }
 
 // find returns the first index from which seg matches path, or -1.
-func find(seg []runeMatcher, path []rune, from int) int {
-	for i := from; i+len(seg) <= len(path); i++ {
-		if matchAt(seg, path, i) {
+func find(seg []runeMatcher, path []rune, from int, b *matchBudget) int {
+	for i := from; i+len(seg) <= len(path) && !b.exceeded(); i++ {
+		if matchAt(seg, path, i, b) {
 			return i
 		}
 	}

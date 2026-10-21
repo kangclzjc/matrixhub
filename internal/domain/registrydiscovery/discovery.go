@@ -35,6 +35,8 @@ var (
 
 // RemoteFileLister lists the files of a remote repository revision through a
 // registry's Hugging Face-compatible API. It is read-only.
+//
+//go:generate go tool mockgen -source=discovery.go -destination=mocks/discovery_mock.go -package=mocks
 type RemoteFileLister interface {
 	// ListRevisionFiles resolves revision (empty means the default branch) on
 	// the registry and lists every file of that commit with LFS details.

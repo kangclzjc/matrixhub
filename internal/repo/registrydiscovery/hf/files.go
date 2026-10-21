@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -31,6 +32,10 @@ import (
 // maxTreePages bounds tree pagination so a misbehaving registry cannot keep a
 // listing running forever.
 const maxTreePages = 100
+
+// maxResponseBytes bounds one response body. A tree page of huggingface.co
+// holds up to 1,000 entries, a few hundred kilobytes.
+const maxResponseBytes = 32 << 20
 
 type revisionInfo struct {
 	SHA string `json:"sha"`
@@ -61,7 +66,7 @@ func (d *Discovery) ListRevisionFiles(ctx context.Context, reg *registry.Registr
 		infoURL += "/revision/" + url.PathEscape(revision)
 	}
 	var info revisionInfo
-	if _, err := d.getJSON(ctx, reg, infoURL, &info); err != nil {
+	if _, err := d.getJSON(ctx, infoURL, &info); err != nil {
 		return nil, err
 	}
 	if info.SHA == "" {
@@ -75,7 +80,7 @@ func (d *Discovery) ListRevisionFiles(ctx context.Context, reg *registry.Registr
 			return nil, fmt.Errorf("tree of %s/%s has more than %d pages", namespace, name, maxTreePages)
 		}
 		var items []treeItem
-		header, err := d.getJSON(ctx, reg, next, &items)
+		header, err := d.getJSON(ctx, next, &items)
 		if err != nil {
 			return nil, err
 		}
@@ -92,8 +97,8 @@ func (d *Discovery) ListRevisionFiles(ctx context.Context, reg *registry.Registr
 			files = append(files, f)
 		}
 		if next = nextLink(header.Get("Link")); next != "" {
-			// The request carries the registry credential, so only follow
-			// pagination links on the registry's own origin.
+			// Only follow pagination links on the registry's own origin, so
+			// a registry cannot send the server to other hosts.
 			if next, err = sameOrigin(base, next); err != nil {
 				return nil, err
 			}
@@ -105,18 +110,19 @@ func (d *Discovery) ListRevisionFiles(ctx context.Context, reg *registry.Registr
 
 // getJSON fetches u and decodes a JSON body into out, mapping HTTP failures to
 // the registrydiscovery sentinel errors.
-func (d *Discovery) getJSON(ctx context.Context, reg *registry.Registry, u string, out any) (http.Header, error) {
+//
+// Requests carry no credential. The proxy sync that a pull runs sends none
+// either, so a preview never lists files that the pull cannot fetch, and a
+// project permission is never enough to act with the registry's credential.
+func (d *Discovery) getJSON(ctx context.Context, u string, out any) (http.Header, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, fmt.Errorf("build hf request: %w", err)
 	}
-	if basic := registry.AsBasic(reg.GetCredential()); basic != nil {
-		req.Header.Set("Authorization", "Bearer "+basic.Password)
-	}
 
 	resp, err := d.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", registrydiscovery.ErrRemoteUnavailable, err)
+		return nil, fmt.Errorf("%w: %w", registrydiscovery.ErrRemoteUnavailable, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -145,7 +151,7 @@ func (d *Discovery) getJSON(ctx context.Context, reg *registry.Registry, u strin
 		return nil, fmt.Errorf("hf request %s returned status %d", u, resp.StatusCode)
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBytes)).Decode(out); err != nil {
 		return nil, fmt.Errorf("decode hf response from %s: %w", u, err)
 	}
 	return resp.Header, nil
