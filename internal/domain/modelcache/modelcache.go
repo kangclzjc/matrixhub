@@ -115,10 +115,15 @@ type CacheStatus struct {
 	Project           string
 	Name              string
 	RequestedRevision string
-	Commit            string
-	State             CacheState
-	Totals            Totals
-	Files             []FileStatus
+	// Revision is the branch, tag or commit that was listed:
+	// RequestedRevision, or the name of the default branch when none was
+	// requested. A dry run leaves it empty when the registry does not name
+	// its default branch.
+	Revision string
+	Commit   string
+	State    CacheState
+	Totals   Totals
+	Files    []FileStatus
 	// Task is the latest run known for the selection; nil when there is
 	// none.
 	Task     *TaskStatus

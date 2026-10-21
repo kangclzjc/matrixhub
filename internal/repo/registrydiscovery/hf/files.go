@@ -23,6 +23,10 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
+
+	"github.com/go-git/go-git/v5/plumbing/protocol/packp"
+	"github.com/go-git/go-git/v5/plumbing/protocol/packp/capability"
 
 	"github.com/matrixhub-ai/matrixhub/internal/domain/git"
 	"github.com/matrixhub-ai/matrixhub/internal/domain/registry"
@@ -36,6 +40,10 @@ const maxTreePages = 100
 // maxResponseBytes bounds one response body. A tree page of huggingface.co
 // holds up to 1,000 entries, a few hundred kilobytes.
 const maxResponseBytes = 32 << 20
+
+// defaultBranchTimeout bounds the lookup of the default branch's name, which
+// only labels a listing.
+const defaultBranchTimeout = 10 * time.Second
 
 type revisionInfo struct {
 	SHA string `json:"sha"`
@@ -105,7 +113,46 @@ func (d *Discovery) ListRevisionFiles(ctx context.Context, reg *registry.Registr
 		}
 	}
 
+	if revision == "" {
+		revision = d.defaultBranch(ctx, base, repoPath, info.SHA)
+	}
 	return &git.RevisionFiles{Revision: revision, Commit: info.SHA, Files: files}, nil
+}
+
+// defaultBranch names the default branch of a repository from its git ref
+// advertisement, as `git ls-remote --symref` does when the proxy creates the
+// mirror. It returns "" when the registry does not tell, or when its HEAD is
+// not at commit, so that the name always matches the listed files. The name
+// only labels a listing, so failing to learn it fails nothing.
+func (d *Discovery) defaultBranch(ctx context.Context, base, repoPath, commit string) string {
+	ctx, cancel := context.WithTimeout(ctx, defaultBranchTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/"+repoPath+"/info/refs?service=git-upload-pack", nil)
+	if err != nil {
+		return ""
+	}
+	resp, err := d.client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+
+	refs := packp.NewAdvRefs()
+	if err := refs.Decode(io.LimitReader(resp.Body, maxResponseBytes)); err != nil {
+		return ""
+	}
+	if refs.Head == nil || refs.Head.String() != commit {
+		return ""
+	}
+	for _, symref := range refs.Capabilities.Get(capability.SymRef) {
+		if branch, ok := strings.CutPrefix(symref, "HEAD:refs/heads/"); ok {
+			return branch
+		}
+	}
+	return ""
 }
 
 // getJSON fetches u and decodes a JSON body into out, mapping HTTP failures to

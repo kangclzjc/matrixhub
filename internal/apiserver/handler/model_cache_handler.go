@@ -175,6 +175,7 @@ func modelCacheStatusToProto(st *modelcache.CacheStatus) *modelv1alpha1.ModelCac
 		Project:           st.Project,
 		Name:              st.Name,
 		RequestedRevision: st.RequestedRevision,
+		Revision:          st.Revision,
 		Commit:            st.Commit,
 		State:             cacheStateToProto(st.State),
 		Totals: &modelv1alpha1.ModelCacheTotals{

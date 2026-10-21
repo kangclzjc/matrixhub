@@ -262,6 +262,7 @@ export type ModelCacheStatus = {
   project?: string
   name?: string
   requestedRevision?: string
+  revision?: string
   commit?: string
   state?: CacheState
   totals?: ModelCacheTotals

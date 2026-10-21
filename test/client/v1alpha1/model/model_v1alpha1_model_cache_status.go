@@ -13,6 +13,8 @@ type V1alpha1ModelCacheStatus struct {
 	Project string `json:"project,omitempty"`
 	Name string `json:"name,omitempty"`
 	RequestedRevision string `json:"requestedRevision,omitempty"`
+	// The branch, tag or commit that was listed: requested_revision, or the name of the default branch when none was requested. A dry run leaves it empty when the registry does not name its default branch.
+	Revision string `json:"revision,omitempty"`
 	Commit string `json:"commit,omitempty"`
 	// How much of the selected files is cached; see CacheState.
 	State *V1alpha1CacheState `json:"state,omitempty"`

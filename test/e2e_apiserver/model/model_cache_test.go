@@ -126,6 +126,7 @@ var _ = Describe("Model cache", Label("model", "model-cache"), func() {
 				AllowPatterns: []string{"*.json"},
 			})
 			Expect(err).NotTo(HaveOccurred())
+			Expect(st.Revision).To(Equal("main"))
 			Expect(st.Commit).To(HaveLen(40))
 			Expect(st.Files).NotTo(BeEmpty())
 			for _, f := range st.Files {

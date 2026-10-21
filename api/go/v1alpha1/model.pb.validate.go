@@ -4539,6 +4539,8 @@ func (m *ModelCacheStatus) validate(all bool) error {
 
 	// no validation rules for RequestedRevision
 
+	// no validation rules for Revision
+
 	// no validation rules for Commit
 
 	// no validation rules for State

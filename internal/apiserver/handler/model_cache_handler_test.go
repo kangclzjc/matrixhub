@@ -218,6 +218,7 @@ func TestModelCacheStatusToProto(t *testing.T) {
 		Project:           "proj",
 		Name:              "model",
 		RequestedRevision: "main",
+		Revision:          "main",
 		Commit:            "c1",
 		State:             modelcache.CacheStatePartial,
 		Totals: modelcache.Totals{
@@ -239,6 +240,7 @@ func TestModelCacheStatusToProto(t *testing.T) {
 		Project:           "proj",
 		Name:              "model",
 		RequestedRevision: "main",
+		Revision:          "main",
 		Commit:            "c1",
 		State:             modelv1alpha1.CacheState_CACHE_STATE_PARTIAL,
 		Totals: &modelv1alpha1.ModelCacheTotals{

@@ -390,15 +390,19 @@ message ModelCacheStatus {
   string project = 1;
   string name = 2;
   string requested_revision = 3;
-  string commit = 4;
+  // The branch, tag or commit that was listed: requested_revision, or the name
+  // of the default branch when none was requested. A dry run leaves it empty
+  // when the registry does not name its default branch.
+  string revision = 4;
+  string commit = 5;
   // How much of the selected files is cached; see CacheState.
-  CacheState state = 5;
-  ModelCacheTotals totals = 6;
-  repeated ModelCacheFile files = 7;
+  CacheState state = 6;
+  ModelCacheTotals totals = 7;
+  repeated ModelCacheFile files = 8;
   // The latest pull that the server knows of: of the requested selection for
   // CacheModel, of the commit for GetModelCache. Unset when there is none, for
   // example when no pull was started, the last one finished more than an hour
   // ago, or the server restarted since.
-  ModelCacheTask task = 8;
-  repeated string warnings = 9;
+  ModelCacheTask task = 9;
+  repeated string warnings = 10;
 }
