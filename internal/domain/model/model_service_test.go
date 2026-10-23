@@ -391,7 +391,40 @@ func TestModelService_RefreshFromRemoteDoesNotCreateModel(t *testing.T) {
 
 	err := service.RefreshFromRemote(ctx, "proj", "model")
 
-	require.ErrorContains(t, err, "not found")
+	require.ErrorIs(t, err, model.ErrModelNotFound)
+}
+
+// A failed lookup during the sync is not a deleted model, although its
+// message says "not found".
+func TestModelService_RefreshFromRemoteFailedSyncIsNotModelNotFound(t *testing.T) {
+	ctx := context.Background()
+	ctrl := gomock.NewController(t)
+	modelRepo := modelmocks.NewMockIModelRepo(ctrl)
+	gitRepo := gitmocks.NewMockIGitRepo(ctrl)
+	projectRepo, registryRepo := newProxyRepoMocks(ctrl)
+	gomock.InOrder(
+		modelRepo.EXPECT().
+			GetByProjectAndName(ctx, "proj", "model").
+			Return(&model.Model{ID: 1, Name: "model"}, nil),
+		gitRepo.EXPECT().PullFromRemote(ctx, gomock.Any()).Return(nil),
+		// SyncMetadata looks the model up again, and the database is busy.
+		modelRepo.EXPECT().
+			GetByProjectAndName(ctx, "proj", "model").
+			Return(nil, errors.New("failed to get model: database is locked")),
+	)
+
+	service := model.NewModelService(
+		modelRepo,
+		nil,
+		gitRepo,
+		projectRepo,
+		registryRepo,
+	)
+
+	err := service.RefreshFromRemote(ctx, "proj", "model")
+
+	require.Error(t, err)
+	require.NotErrorIs(t, err, model.ErrModelNotFound)
 }
 
 func TestModelService_CheckOrSyncFromRemoteRecordsSuccessfulSync(t *testing.T) {

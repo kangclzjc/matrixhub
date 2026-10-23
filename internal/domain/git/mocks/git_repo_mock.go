@@ -268,6 +268,20 @@ func (mr *MockIGitRepoMockRecorder) GetTree(ctx, repoType, project, name, revisi
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetTree", reflect.TypeOf((*MockIGitRepo)(nil).GetTree), ctx, repoType, project, name, revision, path)
 }
 
+// HasCommit mocks base method.
+func (m *MockIGitRepo) HasCommit(ctx context.Context, repoType, project, name, commit string) bool {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "HasCommit", ctx, repoType, project, name, commit)
+	ret0, _ := ret[0].(bool)
+	return ret0
+}
+
+// HasCommit indicates an expected call of HasCommit.
+func (mr *MockIGitRepoMockRecorder) HasCommit(ctx, repoType, project, name, commit any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "HasCommit", reflect.TypeOf((*MockIGitRepo)(nil).HasCommit), ctx, repoType, project, name, commit)
+}
+
 // LFSObjectExists mocks base method.
 func (m *MockIGitRepo) LFSObjectExists(ctx context.Context, oid string) bool {
 	m.ctrl.T.Helper()

@@ -137,6 +137,7 @@ var (
 	ErrRevisionNotFound     = errors.New("model or revision not found")
 	ErrUnsupportedRevision  = errors.New("only branches, tags and commits can be cached")
 	ErrRevisionNotMirrored  = errors.New("revision is not on a branch or tag that MatrixHub mirrors")
+	ErrTooManyFiles         = errors.New("revision has too many files to list")
 	ErrUpstreamSync         = errors.New("upstream sync failed")
 	ErrUpstreamAccessDenied = errors.New("upstream registry denied access")
 	ErrUpstreamUnavailable  = errors.New("upstream registry unavailable")
@@ -163,7 +164,9 @@ type IModelCacheService interface {
 type Options struct {
 	// PerTaskConcurrency bounds concurrent object downloads of one task.
 	PerTaskConcurrency int
-	// GlobalConcurrency bounds concurrent object downloads of all tasks.
+	// GlobalConcurrency bounds concurrent object downloads of all tasks. An
+	// object holds its slot only while it downloads, not while it waits to be
+	// stored, for a re-sync or for its next attempt.
 	GlobalConcurrency int
 	// MaxRunningTasks bounds the number of running tasks.
 	MaxRunningTasks int
@@ -176,10 +179,13 @@ type Options struct {
 	// StallTimeout fails an attempt whose download makes no progress for
 	// this long. Zero means the default; a negative value disables it.
 	StallTimeout time.Duration
-	// RequeueMinInterval rate-limits the forced re-syncs that re-queue
-	// objects of one model.
+	// RequeueMinInterval rate-limits the forced re-syncs of one model, which
+	// re-queue its objects: a re-sync within the interval reports the last
+	// one's result.
 	RequeueMinInterval time.Duration
-	// RefreshTimeout bounds one forced re-sync of a model.
+	// RefreshTimeout bounds how long a pull waits for one forced re-sync of
+	// a model. The mirror cannot always stop git at once, so a re-sync that
+	// outlives it finishes in the background.
 	RefreshTimeout time.Duration
 	// StoreTimeout fails an object whose download finished but is not
 	// stored this long after, because a client still reads it.

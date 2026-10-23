@@ -3839,7 +3839,7 @@ func (m *CacheModelRequest) validate(all bool) error {
 	if !_CacheModelRequest_Name_Pattern.MatchString(m.GetName()) {
 		err := CacheModelRequestValidationError{
 			field:  "Name",
-			reason: "value does not match regex pattern \"^[A-Za-z0-9][A-Za-z0-9_.-]*$\"",
+			reason: "value does not match regex pattern \"^[A-Za-z0-9_][A-Za-z0-9_.-]*$\"",
 		}
 		if !all {
 			return err
@@ -4001,7 +4001,7 @@ var _CacheModelRequest_Name_NotInLookup = map[string]struct{}{
 	"resolve":  {},
 }
 
-var _CacheModelRequest_Name_Pattern = regexp.MustCompile("^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+var _CacheModelRequest_Name_Pattern = regexp.MustCompile("^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
 
 // Validate checks the field values on GetModelCacheRequest with the rules
 // defined in the proto definition for this message. If any rules are
@@ -4061,7 +4061,7 @@ func (m *GetModelCacheRequest) validate(all bool) error {
 	if !_GetModelCacheRequest_Name_Pattern.MatchString(m.GetName()) {
 		err := GetModelCacheRequestValidationError{
 			field:  "Name",
-			reason: "value does not match regex pattern \"^[A-Za-z0-9][A-Za-z0-9_.-]*$\"",
+			reason: "value does not match regex pattern \"^[A-Za-z0-9_][A-Za-z0-9_.-]*$\"",
 		}
 		if !all {
 			return err
@@ -4167,7 +4167,7 @@ var _GetModelCacheRequest_Name_NotInLookup = map[string]struct{}{
 	"resolve":  {},
 }
 
-var _GetModelCacheRequest_Name_Pattern = regexp.MustCompile("^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+var _GetModelCacheRequest_Name_Pattern = regexp.MustCompile("^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
 
 // Validate checks the field values on ModelCacheFile with the rules defined in
 // the proto definition for this message. If any rules are violated, the first

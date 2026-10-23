@@ -19,7 +19,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -104,11 +107,42 @@ func TestListRevisionFiles(t *testing.T) {
 		}
 	}
 
-	if _, err := repo.ListRevisionFiles(ctx, "models", project, name, "no-such-branch"); err == nil || !strings.Contains(err.Error(), "not found") {
-		t.Errorf("unknown revision error = %v, want a not found error", err)
+	if _, err := repo.ListRevisionFiles(ctx, "models", project, name, "no-such-branch"); !errors.Is(err, git.ErrRevisionNotFound) {
+		t.Errorf("unknown revision error = %v, want ErrRevisionNotFound", err)
 	}
-	if _, err := repo.ListRevisionFiles(ctx, "models", project, "missing", ""); err == nil || !strings.Contains(err.Error(), "does not exist") {
-		t.Errorf("missing repository error = %v, want does not exist", err)
+	if _, err := repo.ListRevisionFiles(ctx, "models", project, "missing", ""); !errors.Is(err, git.ErrRevisionNotFound) {
+		t.Errorf("missing repository error = %v, want ErrRevisionNotFound", err)
+	}
+}
+
+func TestHasCommit(t *testing.T) {
+	ctx := context.Background()
+	repo := NewGitDB(hfdstorage.NewStorage(hfdstorage.WithRootDir(t.TempDir())), nil)
+	if err := repo.CreateRepository(ctx, "models", "proj", "model"); err != nil {
+		t.Fatalf("CreateRepository() error = %v", err)
+	}
+	head, err := repo.ListRevisionFiles(ctx, "models", "proj", "model", "")
+	if err != nil {
+		t.Fatalf("ListRevisionFiles() error = %v", err)
+	}
+
+	tests := []struct {
+		name, model, commit string
+		want                bool
+	}{
+		{"commit of the repository", "model", head.Commit, true},
+		{"upper case commit", "model", strings.ToUpper(head.Commit), true},
+		{"unknown commit", "model", strings.Repeat("0", 40), false},
+		{"branch name", "model", "main", false},
+		{"short commit", "model", head.Commit[:7], false},
+		{"missing repository", "missing", head.Commit, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := repo.HasCommit(ctx, "models", "proj", tt.model, tt.commit); got != tt.want {
+				t.Errorf("HasCommit(%s) = %v, want %v", tt.commit, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -130,8 +164,14 @@ func TestLFSObjectExists(t *testing.T) {
 	if !repo.LFSObjectExists(ctx, oid) {
 		t.Fatal("LFSObjectExists() = false after the object is stored")
 	}
-	if repo.LFSObjectExists(ctx, "../../etc/passwd") {
-		t.Fatal("LFSObjectExists() accepted an invalid oid")
+	// The store maps an oid to <lfs>/oid[0:2]/oid[2:4]/oid[4:], so without
+	// the oid check this one would name the file next to the LFS directory.
+	escape := filepath.Join(store.LFSDir(), "..", "escape")
+	if err := os.WriteFile(escape, content, 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	if repo.LFSObjectExists(ctx, "../../escape") {
+		t.Fatal("LFSObjectExists() accepted an oid that leaves the LFS directory")
 	}
 }
 

@@ -37,9 +37,20 @@ import (
 // listing running forever.
 const maxTreePages = 100
 
+// maxRevisionFiles bounds the files of one listing, so a misbehaving registry
+// cannot fill the server's memory with pages of tiny entries. A tree page of
+// huggingface.co holds up to 1,000 entries, so maxTreePages pages hold as
+// many files.
+const maxRevisionFiles = maxTreePages * 1000
+
 // maxResponseBytes bounds one response body. A tree page of huggingface.co
 // holds up to 1,000 entries, a few hundred kilobytes.
 const maxResponseBytes = 32 << 20
+
+// maxAdvertisementBytes bounds the git ref advertisement read for the name of
+// the default branch. The decoder reads every ref, so the default branch of a
+// repository with tens of thousands of refs goes unnamed.
+const maxAdvertisementBytes = 1 << 20
 
 // defaultBranchTimeout bounds the lookup of the default branch's name, which
 // only labels a listing.
@@ -74,7 +85,7 @@ func (d *Discovery) ListRevisionFiles(ctx context.Context, reg *registry.Registr
 		infoURL += "/revision/" + url.PathEscape(revision)
 	}
 	var info revisionInfo
-	if _, err := d.getJSON(ctx, infoURL, &info); err != nil {
+	if _, _, err := d.getJSON(ctx, infoURL, &info); err != nil {
 		return nil, err
 	}
 	if info.SHA == "" {
@@ -85,10 +96,10 @@ func (d *Discovery) ListRevisionFiles(ctx context.Context, reg *registry.Registr
 	next := base + "/api/models/" + repoPath + "/tree/" + url.PathEscape(info.SHA) + "?recursive=true"
 	for page := 0; next != ""; page++ {
 		if page >= maxTreePages {
-			return nil, fmt.Errorf("tree of %s/%s has more than %d pages", namespace, name, maxTreePages)
+			return nil, fmt.Errorf("%w: tree of %s/%s has more than %d pages", registrydiscovery.ErrRemoteTooLarge, namespace, name, maxTreePages)
 		}
 		var items []treeItem
-		header, err := d.getJSON(ctx, next, &items)
+		pageURL, header, err := d.getJSON(ctx, next, &items)
 		if err != nil {
 			return nil, err
 		}
@@ -104,10 +115,16 @@ func (d *Discovery) ListRevisionFiles(ctx context.Context, reg *registry.Registr
 			}
 			files = append(files, f)
 		}
+		if len(files) > maxRevisionFiles {
+			return nil, fmt.Errorf("%w: %s/%s has more than %d files", registrydiscovery.ErrRemoteTooLarge, namespace, name, maxRevisionFiles)
+		}
 		if next = nextLink(header.Get("Link")); next != "" {
-			// Only follow pagination links on the registry's own origin, so
-			// a registry cannot send the server to other hosts.
-			if next, err = sameOrigin(base, next); err != nil {
+			// Redirects are followed, as git follows them when the proxy
+			// syncs: hf-mirror.com, for example, may redirect to
+			// huggingface.co, whose links then name huggingface.co. A link
+			// is therefore resolved against the page that sent it, and
+			// followed only on that page's origin.
+			if next, err = sameOrigin(pageURL, next); err != nil {
 				return nil, err
 			}
 		}
@@ -141,7 +158,7 @@ func (d *Discovery) defaultBranch(ctx context.Context, base, repoPath, commit st
 	}
 
 	refs := packp.NewAdvRefs()
-	if err := refs.Decode(io.LimitReader(resp.Body, maxResponseBytes)); err != nil {
+	if err := refs.Decode(io.LimitReader(resp.Body, maxAdvertisementBytes)); err != nil {
 		return ""
 	}
 	if refs.Head == nil || refs.Head.String() != commit {
@@ -156,20 +173,21 @@ func (d *Discovery) defaultBranch(ctx context.Context, base, repoPath, commit st
 }
 
 // getJSON fetches u and decodes a JSON body into out, mapping HTTP failures to
-// the registrydiscovery sentinel errors.
+// the registrydiscovery sentinel errors. It returns the URL that answered,
+// after redirects, and the response headers.
 //
 // Requests carry no credential. The proxy sync that a pull runs sends none
 // either, so a preview never lists files that the pull cannot fetch, and a
 // project permission is never enough to act with the registry's credential.
-func (d *Discovery) getJSON(ctx context.Context, u string, out any) (http.Header, error) {
+func (d *Discovery) getJSON(ctx context.Context, u string, out any) (*url.URL, http.Header, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return nil, fmt.Errorf("build hf request: %w", err)
+		return nil, nil, fmt.Errorf("build hf request: %w", err)
 	}
 
 	resp, err := d.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", registrydiscovery.ErrRemoteUnavailable, err)
+		return nil, nil, fmt.Errorf("%w: %w", registrydiscovery.ErrRemoteUnavailable, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -181,42 +199,41 @@ func (d *Discovery) getJSON(ctx context.Context, u string, out any) (http.Header
 	switch {
 	case resp.StatusCode == http.StatusOK:
 	case errorCode == "RepoNotFound" || errorCode == "RevisionNotFound" || errorCode == "EntryNotFound":
-		return nil, fmt.Errorf("%w: %s (%s)", registrydiscovery.ErrRemoteNotFound, errorCode, u)
+		return nil, nil, fmt.Errorf("%w: %s (%s)", registrydiscovery.ErrRemoteNotFound, errorCode, u)
 	case errorCode == "GatedRepo":
-		return nil, fmt.Errorf("%w: gated repository needs an authorized credential (%s)", registrydiscovery.ErrRemoteAccessDenied, u)
+		return nil, nil, fmt.Errorf("%w: %w (%s)", registrydiscovery.ErrRemoteAccessDenied, registrydiscovery.ErrRemoteGated, u)
 	case resp.StatusCode == http.StatusNotFound:
-		return nil, fmt.Errorf("%w: %s", registrydiscovery.ErrRemoteNotFound, u)
+		return nil, nil, fmt.Errorf("%w: %s", registrydiscovery.ErrRemoteNotFound, u)
 	case resp.StatusCode == http.StatusUnauthorized && errorMessage != "Invalid credentials in Authorization header":
-		return nil, fmt.Errorf("%w: repository does not exist, or is private and needs a credential (%s)", registrydiscovery.ErrRemoteNotFound, u)
+		return nil, nil, fmt.Errorf("%w: repository does not exist, or is private and needs a credential (%s)", registrydiscovery.ErrRemoteNotFound, u)
 	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
-		return nil, fmt.Errorf("%w: status %d for %s", registrydiscovery.ErrRemoteAccessDenied, resp.StatusCode, u)
+		return nil, nil, fmt.Errorf("%w: status %d for %s", registrydiscovery.ErrRemoteAccessDenied, resp.StatusCode, u)
 	case resp.StatusCode == http.StatusTooManyRequests:
-		return nil, fmt.Errorf("%w: rate limited%s (%s)", registrydiscovery.ErrRemoteUnavailable, retryAfterHint(resp.Header), u)
-	case resp.StatusCode >= http.StatusInternalServerError:
-		return nil, fmt.Errorf("%w: status %d for %s", registrydiscovery.ErrRemoteUnavailable, resp.StatusCode, u)
-	case resp.StatusCode != http.StatusOK:
-		return nil, fmt.Errorf("hf request %s returned status %d", u, resp.StatusCode)
+		return nil, nil, fmt.Errorf("%w: %w%s (%s)", registrydiscovery.ErrRemoteUnavailable, registrydiscovery.ErrRemoteRateLimited, retryAfterHint(resp.Header), u)
+	default:
+		// Any other answer, such as a 5xx or a 4xx that the Hub API does
+		// not use, means the registry cannot serve the listing now.
+		return nil, nil, fmt.Errorf("%w: status %d for %s", registrydiscovery.ErrRemoteUnavailable, resp.StatusCode, u)
 	}
 
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBytes)).Decode(out); err != nil {
-		return nil, fmt.Errorf("decode hf response from %s: %w", u, err)
+		// For example the HTML error page of a proxy in front of the
+		// registry.
+		return nil, nil, fmt.Errorf("%w: decode response from %s: %w", registrydiscovery.ErrRemoteUnavailable, u, err)
 	}
-	return resp.Header, nil
+	return resp.Request.URL, resp.Header, nil
 }
 
-// sameOrigin resolves ref against base and rejects targets on another origin.
-func sameOrigin(base, ref string) (string, error) {
-	b, err := url.Parse(base)
-	if err != nil {
-		return "", fmt.Errorf("parse registry url: %w", err)
-	}
+// sameOrigin resolves ref against the URL of the page that sent it and
+// rejects targets on another origin.
+func sameOrigin(page *url.URL, ref string) (string, error) {
 	r, err := url.Parse(ref)
 	if err != nil {
-		return "", fmt.Errorf("parse pagination link %q: %w", ref, err)
+		return "", fmt.Errorf("%w: parse pagination link %q: %w", registrydiscovery.ErrRemoteUnavailable, ref, err)
 	}
-	resolved := b.ResolveReference(r)
-	if resolved.Scheme != b.Scheme || resolved.Host != b.Host {
-		return "", fmt.Errorf("pagination link %q leaves registry origin %s://%s", ref, b.Scheme, b.Host)
+	resolved := page.ResolveReference(r)
+	if resolved.Scheme != page.Scheme || resolved.Host != page.Host {
+		return "", fmt.Errorf("%w: pagination link %q leaves the origin %s://%s of its page", registrydiscovery.ErrRemoteUnavailable, ref, page.Scheme, page.Host)
 	}
 	return resolved.String(), nil
 }

@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/matrixhub-ai/matrixhub/internal/domain/model"
 	"github.com/matrixhub-ai/matrixhub/internal/infra/log"
 )
 
@@ -49,10 +50,12 @@ type objectState struct {
 type task struct {
 	// id identifies the run; key identifies the selection, so that requests
 	// for the same files attach to a running task.
-	id        string
-	key       string
-	project   string
-	name      string
+	id      string
+	key     string
+	project string
+	name    string
+	// commit is the commit that the run started for. Runs are keyed by their
+	// objects, so pulls of later commits with the same objects attach.
 	commit    string
 	startedAt time.Time
 
@@ -60,8 +63,13 @@ type task struct {
 	state      TaskState
 	finishedAt *time.Time
 	err        string
-	order      []string
 	objects    map[string]*objectState
+	// queue holds the objects that wait for a worker, and active counts the
+	// workers: the run finishes when both are empty. wake tells the
+	// dispatcher that one of them changed.
+	queue  []string
+	active int
+	wake   chan struct{}
 }
 
 func newTask(key, project, name, commit string, oids []string, sizes map[string]int64, now time.Time) *task {
@@ -73,8 +81,9 @@ func newTask(key, project, name, commit string, oids []string, sizes map[string]
 		commit:    commit,
 		startedAt: now,
 		state:     TaskRunning,
-		order:     oids,
+		queue:     oids,
 		objects:   make(map[string]*objectState, len(oids)),
+		wake:      make(chan struct{}, 1),
 	}
 	for _, oid := range oids {
 		t.objects[oid] = &objectState{size: sizes[oid], state: FileQueued}
@@ -88,10 +97,28 @@ func (t *task) running() bool {
 	return t.state == TaskRunning
 }
 
+func (t *task) failed() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.state == TaskFailed
+}
+
 func (t *task) finished() *time.Time {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.finishedAt
+}
+
+// hasAny reports whether the run pulls any of oids.
+func (t *task) hasAny(oids []string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, oid := range oids {
+		if _, ok := t.objects[oid]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func (t *task) update(oid string, fn func(o *objectState)) {
@@ -99,6 +126,36 @@ func (t *task) update(oid string, fn func(o *objectState)) {
 	defer t.mu.Unlock()
 	if o, ok := t.objects[oid]; ok {
 		fn(o)
+	}
+}
+
+// retry queues the failed objects among missing again while the run goes on,
+// and reports whether it does.
+func (t *task) retry(missing []string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.state != TaskRunning {
+		return false
+	}
+	queued := false
+	for _, oid := range missing {
+		if o, ok := t.objects[oid]; ok && o.state == FileFailed {
+			o.state, o.downloaded, o.attempts, o.err = FileQueued, 0, 0, ""
+			t.queue = append(t.queue, oid)
+			queued = true
+		}
+	}
+	if queued {
+		t.signal()
+	}
+	return true
+}
+
+// signal wakes the dispatcher. Signals that it has not seen yet merge.
+func (t *task) signal() {
+	select {
+	case t.wake <- struct{}{}:
+	default:
 	}
 }
 
@@ -129,50 +186,66 @@ func (t *task) snapshot() (map[string]objectState, TaskStatus) {
 	return objects, st
 }
 
-// run downloads the task's objects with bounded concurrency and records the
-// outcome. It runs on the service context, not on a request context.
+// run hands the task's objects to at most PerTaskConcurrency workers and
+// records the outcome. It runs on the service context, not on a request
+// context.
 func (s *Service) run(t *task) {
 	defer s.wg.Done()
-
-	perTask := make(chan struct{}, s.opts.PerTaskConcurrency)
-	var workers sync.WaitGroup
-dispatch:
-	for _, oid := range t.order {
-		if s.git.LFSObjectExists(s.ctx, oid) {
-			t.update(oid, func(o *objectState) { o.state = FileCached })
+	for {
+		oid, done := s.next(t)
+		if done {
+			return
+		}
+		if oid != "" {
+			go s.work(t, oid)
+			continue
+		}
+		// Wait for a worker to end or for retried objects. Once the service
+		// closes, only the workers' ends matter.
+		if s.ctx.Err() != nil {
+			<-t.wake
 			continue
 		}
 		select {
-		case perTask <- struct{}{}:
+		case <-t.wake:
 		case <-s.ctx.Done():
-			break dispatch
 		}
-		select {
-		case s.global <- struct{}{}:
-		case <-s.ctx.Done():
-			<-perTask
-			break dispatch
-		}
-		workers.Add(1)
-		go func(oid string) {
-			defer workers.Done()
-			defer func() {
-				<-s.global
-				<-perTask
-			}()
-			s.fetchWithRetry(t, oid)
-		}(oid)
 	}
-	workers.Wait()
-	s.finish(t)
 }
 
-func (s *Service) finish(t *task) {
-	now := s.opts.Now()
-	interrupted := s.ctx.Err() != nil
-
+// next returns the object to hand to a new worker, "" when the dispatcher
+// must wait, or done once the run finished. It finishes the run under the
+// lock that retry takes, so no object is queued into a finished run.
+func (s *Service) next(t *task) (oid string, done bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	closing := s.ctx.Err() != nil
+	if !closing && len(t.queue) > 0 && t.active < s.opts.PerTaskConcurrency {
+		oid, t.queue = t.queue[0], t.queue[1:]
+		t.active++
+		return oid, false
+	}
+	if t.active == 0 && (closing || len(t.queue) == 0) {
+		s.finishLocked(t)
+		return "", true
+	}
+	return "", false
+}
+
+func (s *Service) work(t *task, oid string) {
+	defer func() {
+		t.mu.Lock()
+		t.active--
+		t.mu.Unlock()
+		t.signal()
+	}()
+	s.fetchWithRetry(t, oid)
+}
+
+// finishLocked records the outcome of the run; t.mu is held.
+func (s *Service) finishLocked(t *task) {
+	now := s.opts.Now()
+	interrupted := s.ctx.Err() != nil
 	failed := 0
 	for _, o := range t.objects {
 		if o.state == FileCached {
@@ -184,23 +257,54 @@ func (s *Service) finish(t *task) {
 		}
 	}
 	switch {
+	case failed == 0:
+		t.state = TaskSucceeded
 	case interrupted:
 		t.state, t.err = TaskFailed, "interrupted: server shutting down"
-	case failed > 0:
-		t.state, t.err = TaskFailed, fmt.Sprintf("%d of %d files failed", failed, len(t.objects))
 	default:
-		t.state = TaskSucceeded
+		t.state, t.err = TaskFailed, fmt.Sprintf("%d of %d LFS objects failed", failed, len(t.objects))
 	}
 	t.finishedAt = &now
 	log.Infof("model cache: task %s (%s) finished: state=%d failed=%d", t.id, t.key, t.state, failed)
 }
 
+// slot is one of the GlobalConcurrency download slots of the server, held by
+// one worker.
+type slot struct {
+	ch   chan struct{}
+	held bool
+}
+
+func (sl *slot) acquire(ctx context.Context) error {
+	if sl.held {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case sl.ch <- struct{}{}:
+		sl.held = true
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (sl *slot) release() {
+	if sl.held {
+		<-sl.ch
+		sl.held = false
+	}
+}
+
 func (s *Service) fetchWithRetry(t *task, oid string) {
+	sl := &slot{ch: s.global}
+	defer sl.release()
 	for attempt := 1; attempt <= s.opts.MaxAttempts; attempt++ {
-		t.update(oid, func(o *objectState) {
-			o.state, o.attempts = FileDownloading, attempt
-		})
-		err := s.fetchOnce(t, oid)
+		t.update(oid, func(o *objectState) { o.attempts = attempt })
+		err := s.fetchOnce(t, oid, sl)
+		sl.release()
 		if err == nil {
 			t.update(oid, func(o *objectState) {
 				o.state, o.downloaded, o.err = FileCached, o.size, ""
@@ -220,6 +324,7 @@ func (s *Service) fetchWithRetry(t *task, oid string) {
 		}
 		backoff := s.opts.RetryBackoff << (attempt - 1)
 		t.update(oid, func(o *objectState) {
+			o.state = FileQueued
 			o.err = fmt.Sprintf("attempt %d/%d failed: %s; retrying in %s", attempt, s.opts.MaxAttempts, publicError(err), backoff)
 		})
 		if !sleepCtx(s.ctx, backoff) {
@@ -233,16 +338,25 @@ func (s *Service) fetchWithRetry(t *task, oid string) {
 
 // fetchOnce makes sure the object is downloading, re-queuing it through a
 // forced model sync when the mirror no longer tracks it, and waits until it
-// is stored.
-func (s *Service) fetchOnce(t *task, oid string) error {
+// is stored. It holds a download slot only while the object downloads.
+func (s *Service) fetchOnce(t *task, oid string, sl *slot) error {
 	if s.git.LFSObjectExists(s.ctx, oid) {
 		return nil
 	}
+	if err := sl.acquire(s.ctx); err != nil {
+		return err
+	}
+	t.update(oid, func(o *objectState) { o.state = FileDownloading })
 	if s.git.FetchLFSObject(s.ctx, oid) == nil {
 		if s.git.LFSObjectExists(s.ctx, oid) {
 			return nil
 		}
+		// A sync is no download: the slot is free meanwhile.
+		sl.release()
 		if err := s.requeue(t.project, t.name); err != nil {
+			return err
+		}
+		if err := sl.acquire(s.ctx); err != nil {
 			return err
 		}
 		if s.git.FetchLFSObject(s.ctx, oid) == nil {
@@ -252,13 +366,13 @@ func (s *Service) fetchOnce(t *task, oid string) error {
 			return errNotQueued
 		}
 	}
-	return s.waitStored(t, oid)
+	return s.waitStored(t, oid, sl)
 }
 
 // waitStored polls until the object is stored. The mirror moves a finished
 // download into storage before it forgets the download, so storage is checked
 // first and again whenever the download disappears.
-func (s *Service) waitStored(t *task, oid string) error {
+func (s *Service) waitStored(t *task, oid string, sl *slot) error {
 	ticker := time.NewTicker(s.opts.PollInterval)
 	defer ticker.Stop()
 
@@ -282,8 +396,10 @@ func (s *Service) waitStored(t *task, oid string) error {
 		switch {
 		case downloaded >= d.Total():
 			// A complete download is stored once its readers close. That
-			// is not a stall, but a reader that never closes must not keep
-			// the task running forever.
+			// is not a stall, and it downloads nothing, so the slot is
+			// free; but a reader that never closes must not keep the task
+			// running forever.
+			sl.release()
 			if complete.IsZero() {
 				complete = now
 			}
@@ -306,45 +422,82 @@ func (s *Service) waitStored(t *task, oid string) error {
 	}
 }
 
-// requeueResult is the outcome of the last forced sync of a model.
-type requeueResult struct {
+// refreshResult is the outcome of the last forced sync of a model.
+type refreshResult struct {
 	at  time.Time
 	err error
 }
 
-// requeue forces a sync of the model so the mirror queues its missing objects
-// again. Concurrent calls for one model are merged and rate limited, because
-// one sync re-queues every missing object of the repository; a call within
-// the interval gets the result of the last sync.
-func (s *Service) requeue(project, name string) error {
+// refresh forces a sync of the model, which also re-queues its missing
+// objects. Calls for one model are merged and rate limited, because one sync
+// re-queues every missing object of the repository: a call within
+// RequeueMinInterval of the last sync gets that sync's result. The sync runs
+// on the service context for at most RefreshTimeout, and the caller stops
+// waiting when its own context ends.
+func (s *Service) refresh(ctx context.Context, project, name string) error {
 	key := project + "/" + name
-	_, err, _ := s.requeueGroup.Do(key, func() (any, error) {
+	ch := s.refreshGroup.DoChan(key, func() (any, error) {
 		s.mu.Lock()
-		last, ok := s.lastRequeue[key]
+		last, ok := s.lastRefresh[key]
 		s.mu.Unlock()
 		if ok && s.opts.Now().Sub(last.at) < s.opts.RequeueMinInterval {
 			return nil, last.err
 		}
 		start := s.opts.Now()
-		ctx, cancel := context.WithTimeout(s.ctx, s.opts.RefreshTimeout)
+		rctx, cancel := context.WithTimeout(s.ctx, s.opts.RefreshTimeout)
 		defer cancel()
 		// RefreshFromRemote never creates the model, so a deleted model
 		// stays deleted.
-		err := s.models.RefreshFromRemote(ctx, project, name)
-		switch {
-		case err == nil:
-		case isNotFound(err):
-			err = errModelGone
-		default:
+		err := untilDone(rctx, func(ctx context.Context) error {
+			return s.models.RefreshFromRemote(ctx, project, name)
+		})
+		if err != nil && !errors.Is(err, model.ErrModelNotFound) {
 			log.Warnf("model cache: refresh of %s/%s from upstream failed: %v", project, name, err)
-			err = fmt.Errorf("%w: %w", errResyncFailed, err)
 		}
 		s.mu.Lock()
-		s.lastRequeue[key] = requeueResult{at: start, err: err}
+		s.lastRefresh[key] = refreshResult{at: start, err: err}
 		s.mu.Unlock()
 		return nil, err
 	})
-	return err
+	select {
+	case r := <-ch:
+		return r.Err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// requeue forces a sync of the model so the mirror queues its missing objects
+// again; see refresh.
+func (s *Service) requeue(project, name string) error {
+	switch err := s.refresh(s.ctx, project, name); {
+	case err == nil:
+		return nil
+	case errors.Is(err, model.ErrModelNotFound):
+		return errModelGone
+	default:
+		return fmt.Errorf("%w: %w", errResyncFailed, err)
+	}
+}
+
+// untilDone runs fn and returns its error, or ctx's error once ctx ends. The
+// mirror runs git without a wait delay, so a git command can outlive its
+// context until upstream answers; the caller then stops waiting, and fn ends
+// in the background.
+func untilDone(ctx context.Context, fn func(context.Context) error) error {
+	done := make(chan error, 1)
+	go func() { done <- fn(ctx) }()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		select {
+		case err := <-done:
+			return err
+		default:
+			return ctx.Err()
+		}
+	}
 }
 
 // publicError returns the message that a status shows for err.

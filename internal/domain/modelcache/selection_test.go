@@ -65,6 +65,13 @@ func TestGlob(t *testing.T) {
 		{"[!]", "[!]", true},
 		{"模型/*.bin", "模型/权重.bin", true},
 		{"???", "ab", false},
+		// As in fnmatch, a reversed range is dropped: a class left empty
+		// matches nothing, or, negated, anything.
+		{"[z-a]x", "ax", false},
+		{"[z-a]x", "zx", false},
+		{"[!b-a]x", "qx", true},
+		{"[b-aX]", "X", true},
+		{"[b-aX]", "b", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.pattern+"~"+tt.path, func(t *testing.T) {
@@ -76,13 +83,66 @@ func TestGlob(t *testing.T) {
 }
 
 func TestGlobRejectsInvalidPatterns(t *testing.T) {
-	for _, pattern := range []string{"[z-a]", "\xff*", strings.Repeat("?", maxPatternWildcards+1)} {
+	for _, pattern := range []string{"\xff*", strings.Repeat("?", maxPatternWildcards+1)} {
 		_, err := compileGlob(pattern)
 		require.ErrorIs(t, err, ErrInvalidSelection, pattern)
 	}
 	// A run of '*' counts as one wildcard.
 	_, err := compileGlob(strings.Repeat("*", 500) + "zz")
 	require.NoError(t, err)
+
+	// The '*' that a trailing '/' implies is not counted, and errors quote
+	// the pattern as given.
+	dir := strings.Repeat("?", maxPatternWildcards) + "/"
+	_, err = compileGlob(dir)
+	require.NoError(t, err)
+	_, err = compileGlob("?" + dir)
+	require.ErrorContains(t, err, fmt.Sprintf("%q", "?"+dir))
+}
+
+// A class compares a rune with each of its ranges, and the budget counts
+// every comparison.
+func TestGlobChargesEachRangeOfAClass(t *testing.T) {
+	g, err := compileGlob("[" + cjkRunes(200) + "]")
+	require.NoError(t, err)
+	b := &matchBudget{max: maxMatchSteps}
+
+	require.False(t, g.match([]rune("x"), b))
+	require.Equal(t, 200, b.steps)
+}
+
+// cjkRunes returns n distinct runes that paths of ASCII never contain.
+func cjkRunes(n int) string {
+	var sb strings.Builder
+	for i := range n {
+		sb.WriteRune(rune(0x4e00 + 2*i))
+	}
+	return sb.String()
+}
+
+// Classes of many ranges cost a comparison per range, so such patterns
+// against many paths exhaust the budget instead of keeping the server busy
+// for a minute.
+func TestPlanFailsWhenClassesAreTooExpensive(t *testing.T) {
+	var allow []string
+	for range 16 {
+		allow = append(allow, "*["+cjkRunes(252)+"]*")
+	}
+	sel, err := compileSelection(Selection{AllowPatterns: allow})
+	require.NoError(t, err)
+	// Matching makes about 6.4 million comparisons of a rune with a class,
+	// each against 252 ranges: within this budget only if a class counted
+	// as one comparison.
+	sel.maxSteps = 10_000_000
+	files := make([]git.RevisionFile, 2000)
+	for i := range files {
+		files[i] = git.RevisionFile{Path: fmt.Sprintf("%05d/", i) + strings.Repeat("abcdefgh/", 21)}
+	}
+
+	start := time.Now()
+	_, err = sel.plan(files)
+	require.ErrorIs(t, err, ErrInvalidSelection)
+	require.Less(t, time.Since(start), 2*time.Second)
 }
 
 // The regular expressions that patterns used to compile to took seconds to
@@ -218,7 +278,7 @@ func TestPlanDeduplicatesObjects(t *testing.T) {
 }
 
 func TestTaskKey(t *testing.T) {
-	require.Equal(t, taskKey("p", "m", "c1", []string{"a", "b"}), taskKey("p", "m", "c1", []string{"b", "a"}))
-	require.NotEqual(t, taskKey("p", "m", "c1", []string{"a"}), taskKey("p", "m", "c2", []string{"a"}))
-	require.NotEqual(t, taskKey("p", "m", "c1", []string{"a"}), taskKey("p", "m", "c1", []string{"a", "b"}))
+	require.Equal(t, taskKey("p", "m", []string{"a", "b"}), taskKey("p", "m", []string{"b", "a"}))
+	require.NotEqual(t, taskKey("p", "m", []string{"a"}), taskKey("p", "m", []string{"a", "b"}))
+	require.NotEqual(t, taskKey("p", "m", []string{"a"}), taskKey("p", "other", []string{"a"}))
 }

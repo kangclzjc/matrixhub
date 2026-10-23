@@ -66,7 +66,8 @@ type IModelService interface {
 	// RefreshFromRemote is CheckOrSyncFromRemote without the sync TTL: it
 	// synchronizes a proxy model now, which also re-queues every LFS object
 	// that is not stored locally. Unlike CheckOrSyncFromRemote, it never
-	// creates the model.
+	// creates the model: it fails with ErrModelNotFound when the model does
+	// not exist.
 	RefreshFromRemote(ctx context.Context, project, name string) error
 }
 
@@ -394,7 +395,7 @@ func (s *ModelService) syncFromRemote(ctx context.Context, project, name string,
 			return err
 		}
 		if !exists {
-			return fmt.Errorf("model %s/%s not found", project, name)
+			return fmt.Errorf("%w: %s/%s", ErrModelNotFound, project, name)
 		}
 	} else {
 		if mod, err = s.ensureModelRecord(ctx, project, name); err != nil {

@@ -29,8 +29,18 @@ var (
 	// ErrRemoteAccessDenied means the registry refused access, e.g. a gated
 	// or private repository without a usable credential.
 	ErrRemoteAccessDenied = errors.New("remote registry denied access")
-	// ErrRemoteUnavailable means the registry could not be reached.
+	// ErrRemoteUnavailable means the registry could not be reached, or did
+	// not answer with a listing.
 	ErrRemoteUnavailable = errors.New("remote registry unavailable")
+	// ErrRemoteTooLarge means the revision has more files than a listing
+	// holds.
+	ErrRemoteTooLarge = errors.New("remote revision has too many files")
+	// ErrRemoteGated comes with ErrRemoteAccessDenied for a gated repository,
+	// whose files need a credential that accepted its terms.
+	ErrRemoteGated = errors.New("gated repository needs an authorized credential")
+	// ErrRemoteRateLimited comes with ErrRemoteUnavailable when the registry
+	// asks to retry later.
+	ErrRemoteRateLimited = errors.New("rate limited")
 )
 
 // RemoteFileLister lists the files of a remote repository revision through a

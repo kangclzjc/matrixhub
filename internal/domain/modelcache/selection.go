@@ -139,11 +139,12 @@ func matchAny(globs []*glob, path []rune, b *matchBudget) bool {
 }
 
 // taskKey identifies the files a task pulls: requests that pick the same
-// objects of the same commit attach to one running task. It is internal; task
-// IDs identify runs.
-func taskKey(project, name, commit string, objects []string) string {
+// objects of one model attach to one running task, also when the branch moved
+// meanwhile to a commit with the same objects. It is internal; task IDs
+// identify runs.
+func taskKey(project, name string, objects []string) string {
 	sorted := slices.Clone(objects)
 	slices.Sort(sorted)
 	sum := sha256.Sum256([]byte(strings.Join(sorted, "\n")))
-	return project + "/" + name + "@" + commit + "#" + hex.EncodeToString(sum[:])[:16]
+	return project + "/" + name + "#" + hex.EncodeToString(sum[:])[:16]
 }

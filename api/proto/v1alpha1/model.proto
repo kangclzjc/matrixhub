@@ -314,14 +314,16 @@ enum CacheTaskState {
 
 message CacheModelRequest {
   string project = 1 [(validate.rules).string.min_len = 1];
+  // Name of the model. As on Hugging Face, it may start with '_'.
   string name = 2 [(validate.rules).string = {
     min_len: 1,
     max_len: 251,
-    pattern: "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+    pattern: "^[A-Za-z0-9_][A-Za-z0-9_.-]*$",
     not_in: ["models", "datasets", "spaces", "resolve"]
   }];
   // Branch, tag or commit. Empty means the default branch. Other refs, such as
-  // refs/pr/1, are rejected: MatrixHub mirrors only branches and tags.
+  // refs/pr/1, are rejected: MatrixHub mirrors only branches and tags. So are
+  // revision expressions such as main~1, which upstream does not resolve.
   string revision = 3 [(validate.rules).string.max_len = 255];
   // Narrow the cached files; without patterns every file of the revision is
   // cached. Patterns follow huggingface_hub fnmatch semantics: '*' and '?'
@@ -340,10 +342,11 @@ message CacheModelRequest {
 
 message GetModelCacheRequest {
   string project = 1 [(validate.rules).string.min_len = 1];
+  // Name of the model. As on Hugging Face, it may start with '_'.
   string name = 2 [(validate.rules).string = {
     min_len: 1,
     max_len: 251,
-    pattern: "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+    pattern: "^[A-Za-z0-9_][A-Za-z0-9_.-]*$",
     not_in: ["models", "datasets", "spaces", "resolve"]
   }];
   // Branch, tag or commit. Empty means the default branch.

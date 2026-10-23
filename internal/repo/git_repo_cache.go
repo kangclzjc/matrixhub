@@ -17,6 +17,7 @@ package repo
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	hfdlfs "github.com/matrixhub-ai/hfd/pkg/lfs"
 	"github.com/matrixhub-ai/hfd/pkg/mirror"
@@ -30,7 +31,7 @@ import (
 func (g *gitRepo) ListRevisionFiles(ctx context.Context, repoType, project, name, revision string) (*git.RevisionFiles, error) {
 	gitPath := g.gitPath(repoType, project, name)
 	if !repository.IsRepository(gitPath) {
-		return nil, fmt.Errorf("repository does not exist at %s", gitPath)
+		return nil, fmt.Errorf("%w: repository does not exist at %s", git.ErrRevisionNotFound, gitPath)
 	}
 	repo, err := repository.Open(gitPath)
 	if err != nil {
@@ -43,7 +44,7 @@ func (g *gitRepo) ListRevisionFiles(ctx context.Context, repoType, project, name
 	}
 	commit, err := repo.ResolveRevision(resolveRef(repo, rev))
 	if err != nil {
-		return nil, fmt.Errorf("revision %q not found: %w", rev, err)
+		return nil, fmt.Errorf("%w: %q: %w", git.ErrRevisionNotFound, rev, err)
 	}
 
 	// List the resolved commit rather than the ref so the files match the
@@ -75,6 +76,24 @@ func (g *gitRepo) ListRevisionFiles(ctx context.Context, repoType, project, name
 	}
 
 	return &git.RevisionFiles{Revision: rev, Commit: commit, Files: files}, nil
+}
+
+// HasCommit reports whether the local repository has commit. Unlike
+// ListRevisionFiles, it reads no tree or blob.
+func (g *gitRepo) HasCommit(_ context.Context, repoType, project, name, commit string) bool {
+	if !isCommitSHA(commit) {
+		return false
+	}
+	gitPath := g.gitPath(repoType, project, name)
+	if !repository.IsRepository(gitPath) {
+		return false
+	}
+	repo, err := repository.Open(gitPath)
+	if err != nil {
+		return false
+	}
+	resolved, err := repo.ResolveRevision(commit)
+	return err == nil && strings.EqualFold(resolved, commit)
 }
 
 // LFSObjectExists reports whether an LFS object is fully stored locally.

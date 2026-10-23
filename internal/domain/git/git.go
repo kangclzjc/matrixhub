@@ -16,9 +16,14 @@ package git
 
 import (
 	"context"
+	"errors"
 	"io"
 	"time"
 )
+
+// ErrRevisionNotFound reports that a repository, or a revision in it, does
+// not exist locally.
+var ErrRevisionNotFound = errors.New("revision not found")
 
 // Git-related types for model version control
 
@@ -231,7 +236,12 @@ type IGitRepo interface {
 	// ListRevisionFiles resolves revision (branch, tag or commit; empty means
 	// the default branch) in the local repository and lists every file of
 	// that commit recursively, with LFS pointer details.
+	// It fails with ErrRevisionNotFound when the repository or the revision
+	// does not exist.
 	ListRevisionFiles(ctx context.Context, repoType, project, name, revision string) (*RevisionFiles, error)
+	// HasCommit reports whether the local repository has the commit, given as
+	// a full commit id. It does not read the commit's files.
+	HasCommit(ctx context.Context, repoType, project, name, commit string) bool
 	// LFSObjectExists reports whether an LFS object is fully stored locally.
 	// It never contacts upstream.
 	LFSObjectExists(ctx context.Context, oid string) bool

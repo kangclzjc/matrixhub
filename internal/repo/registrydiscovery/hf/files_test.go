@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/matrixhub-ai/matrixhub/internal/domain/git"
@@ -160,10 +161,13 @@ func TestDiscovery_ListRevisionFiles_Errors(t *testing.T) {
 		{"anonymous 401", http.StatusUnauthorized, "", "Invalid username or password.", registrydiscovery.ErrRemoteNotFound},
 		{"repo not found", http.StatusUnauthorized, "RepoNotFound", "", registrydiscovery.ErrRemoteNotFound},
 		{"bad credential", http.StatusUnauthorized, "", "Invalid credentials in Authorization header", registrydiscovery.ErrRemoteAccessDenied},
-		{"gated", http.StatusForbidden, "GatedRepo", "", registrydiscovery.ErrRemoteAccessDenied},
+		{"gated", http.StatusForbidden, "GatedRepo", "", registrydiscovery.ErrRemoteGated},
 		{"403", http.StatusForbidden, "", "", registrydiscovery.ErrRemoteAccessDenied},
 		{"502", http.StatusBadGateway, "", "", registrydiscovery.ErrRemoteUnavailable},
 		{"rate limited", http.StatusTooManyRequests, "", "", registrydiscovery.ErrRemoteUnavailable},
+		// Statuses the Hub API does not use for a listing.
+		{"400", http.StatusBadRequest, "", "", registrydiscovery.ErrRemoteUnavailable},
+		{"410", http.StatusGone, "", "", registrydiscovery.ErrRemoteUnavailable},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -194,7 +198,8 @@ func TestDiscovery_ListRevisionFiles_RateLimited(t *testing.T) {
 	defer ts.Close()
 
 	_, err := New().ListRevisionFiles(context.Background(), &registry.Registry{URL: ts.URL}, "Qwen", "Qwen3-0.6B", "")
-	if !errors.Is(err, registrydiscovery.ErrRemoteUnavailable) || !strings.Contains(err.Error(), "retry after 30s") {
+	if !errors.Is(err, registrydiscovery.ErrRemoteUnavailable) || !errors.Is(err, registrydiscovery.ErrRemoteRateLimited) ||
+		!strings.Contains(err.Error(), "retry after 30s") {
 		t.Fatalf("error = %v, want a rate limit with its retry delay", err)
 	}
 }
@@ -211,18 +216,111 @@ func TestDiscovery_ListRevisionFiles_Unreachable(t *testing.T) {
 }
 
 func TestDiscovery_ListRevisionFiles_RejectsCrossOriginPagination(t *testing.T) {
+	var otherRequests atomic.Int32
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		otherRequests.Add(1)
+		fmt.Fprint(w, `[{"type":"file","path":"from-another-origin","size":1}]`)
+	}))
+	defer other.Close()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/models/Qwen/x" {
 			fmt.Fprintf(w, `{"sha":%q}`, testSHA)
 			return
 		}
-		w.Header().Set("Link", `<https://evil.example/api/next>; rel="next"`)
+		w.Header().Set("Link", fmt.Sprintf(`<%s/api/next>; rel="next"`, other.URL))
 		fmt.Fprint(w, `[]`)
 	}))
 	defer ts.Close()
 
-	if _, err := New().ListRevisionFiles(context.Background(), &registry.Registry{URL: ts.URL}, "Qwen", "x", ""); err == nil {
-		t.Fatal("ListRevisionFiles() followed a pagination link to another origin")
+	_, err := New().ListRevisionFiles(context.Background(), &registry.Registry{URL: ts.URL}, "Qwen", "x", "")
+	if !errors.Is(err, registrydiscovery.ErrRemoteUnavailable) {
+		t.Fatalf("error = %v, want ErrRemoteUnavailable", err)
+	}
+	if n := otherRequests.Load(); n != 0 {
+		t.Fatalf("the other origin received %d requests", n)
+	}
+}
+
+// hf-mirror.com may redirect to huggingface.co, whose pagination links then
+// name huggingface.co rather than the registry.
+func TestDiscovery_ListRevisionFiles_FollowsPaginationAfterRedirect(t *testing.T) {
+	var target *httptest.Server
+	target = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/models/Qwen/big/revision/main":
+			fmt.Fprintf(w, `{"sha":%q}`, testSHA)
+		case r.URL.Query().Get("cursor") == "":
+			w.Header().Set("Link", fmt.Sprintf(`<%s/api/models/Qwen/big/tree/%s?recursive=true&cursor=p2>; rel="next"`, target.URL, testSHA))
+			fmt.Fprint(w, `[{"type":"file","path":"a","size":1}]`)
+		case r.URL.Query().Get("cursor") == "p2":
+			fmt.Fprint(w, `[{"type":"file","path":"b","size":2}]`)
+		default:
+			t.Errorf("unexpected request %s", r.URL)
+		}
+	}))
+	defer target.Close()
+	mirror := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+r.URL.RequestURI(), http.StatusPermanentRedirect)
+	}))
+	defer mirror.Close()
+
+	got, err := New().ListRevisionFiles(context.Background(), &registry.Registry{URL: mirror.URL}, "Qwen", "big", "main")
+	if err != nil {
+		t.Fatalf("ListRevisionFiles() error = %v", err)
+	}
+	if len(got.Files) != 2 || got.Files[0].Path != "a" || got.Files[1].Path != "b" {
+		t.Fatalf("files = %+v, want a and b", got.Files)
+	}
+}
+
+func TestDiscovery_ListRevisionFiles_TooLarge(t *testing.T) {
+	tests := map[string]http.HandlerFunc{
+		// Every page links to another one.
+		"too many pages": func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Link", fmt.Sprintf(`<%s?recursive=true&cursor=%s>; rel="next"`, r.URL.Path, r.URL.Query().Get("cursor")+"x"))
+			fmt.Fprint(w, `[{"type":"file","path":"a","size":1}]`)
+		},
+		"too many files": func(w http.ResponseWriter, _ *http.Request) {
+			fmt.Fprint(w, "[")
+			for i := range maxRevisionFiles + 1 {
+				if i > 0 {
+					fmt.Fprint(w, ",")
+				}
+				fmt.Fprintf(w, `{"type":"file","path":"f%d"}`, i)
+			}
+			fmt.Fprint(w, "]")
+		},
+	}
+	for name, tree := range tests {
+		t.Run(name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/api/models/Qwen/x" {
+					fmt.Fprintf(w, `{"sha":%q}`, testSHA)
+					return
+				}
+				tree(w, r)
+			}))
+			defer ts.Close()
+
+			_, err := New().ListRevisionFiles(context.Background(), &registry.Registry{URL: ts.URL}, "Qwen", "x", "")
+			if !errors.Is(err, registrydiscovery.ErrRemoteTooLarge) {
+				t.Fatalf("error = %v, want ErrRemoteTooLarge", err)
+			}
+		})
+	}
+}
+
+// For example the HTML error page of a proxy in front of the registry.
+func TestDiscovery_ListRevisionFiles_NotAListing(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, "<html><body>Service Unavailable</body></html>")
+	}))
+	defer ts.Close()
+
+	_, err := New().ListRevisionFiles(context.Background(), &registry.Registry{URL: ts.URL}, "Qwen", "x", "")
+	if !errors.Is(err, registrydiscovery.ErrRemoteUnavailable) {
+		t.Fatalf("error = %v, want ErrRemoteUnavailable", err)
 	}
 }
 

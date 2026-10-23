@@ -47,14 +47,14 @@ type Service struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	// mu guards tasks, lastRequeue and modelLocks. Lock order: s.mu, then
+	// mu guards tasks, lastRefresh and modelLocks. Lock order: s.mu, then
 	// task.mu.
 	mu           sync.Mutex
 	tasks        map[string]*task
-	lastRequeue  map[string]requeueResult
+	lastRefresh  map[string]refreshResult
 	modelLocks   map[string]*modelLock
 	global       chan struct{}
-	requeueGroup singleflight.Group
+	refreshGroup singleflight.Group
 }
 
 // modelLock serializes the pulls of one model. A channel, unlike a mutex,
@@ -85,7 +85,7 @@ func NewModelCacheService(
 		ctx:         ctx,
 		cancel:      cancel,
 		tasks:       map[string]*task{},
-		lastRequeue: map[string]requeueResult{},
+		lastRefresh: map[string]refreshResult{},
 		modelLocks:  map[string]*modelLock{},
 		global:      make(chan struct{}, opts.GlobalConcurrency),
 	}
@@ -116,10 +116,10 @@ func (s *Service) CacheModel(ctx context.Context, req *Request) (*CacheStatus, e
 		if err != nil {
 			return nil, err
 		}
-		key := taskKey(req.Project, req.Name, remote.Commit, p.objects)
 		s.gc()
 		gitCached := s.localHasCommit(ctx, req.Project, req.Name, remote.Commit)
-		return s.buildStatus(ctx, req.Project, req.Name, req.Revision, remote, p, s.lookupTask(key), gitCached), nil
+		t := s.lookupTask(taskKey(req.Project, req.Name, p.objects))
+		return s.buildStatus(ctx, req.Project, req.Name, req.Revision, remote, p, t, gitCached), nil
 	}
 
 	// Pulls of one model take turns, so two pulls of a new model do not both
@@ -151,24 +151,23 @@ func (s *Service) CacheModel(ctx context.Context, req *Request) (*CacheStatus, e
 		if len(p.files) == 0 {
 			return nil, fmt.Errorf("%w: the selection matched no files", ErrInvalidSelection)
 		}
-		if err := s.checkCapacity(); err != nil {
-			return nil, err
+		// Other models may have stored the objects already, and a pull that
+		// downloads nothing starts no task.
+		if len(s.missingObjects(ctx, p.objects)) > 0 {
+			if err := s.checkCapacity(); err != nil {
+				return nil, err
+			}
 		}
 	}
-	if err := s.models.CheckOrSyncFromRemote(ctx, req.Project, req.Name); err != nil {
+	if err := untilDone(ctx, func(ctx context.Context) error {
+		return s.models.CheckOrSyncFromRemote(ctx, req.Project, req.Name)
+	}); err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrUpstreamSync, err)
 	}
 
 	local, err := s.listLocal(ctx, req.Project, req.Name, req.Revision)
 	if errors.Is(err, ErrRevisionNotFound) {
-		// The revision may exist upstream but be newer than the last sync.
-		if rerr := s.models.RefreshFromRemote(ctx, req.Project, req.Name); rerr != nil {
-			return nil, fmt.Errorf("%w: %w", ErrUpstreamSync, rerr)
-		}
-		local, err = s.listLocal(ctx, req.Project, req.Name, req.Revision)
-	}
-	if errors.Is(err, ErrRevisionNotFound) {
-		return nil, s.explainMissingRevision(ctx, prj, reg, req, remote, err)
+		local, err = s.fetchRevision(ctx, prj, reg, req, remote, err)
 	}
 	if err != nil {
 		return nil, err
@@ -181,16 +180,9 @@ func (s *Service) CacheModel(ctx context.Context, req *Request) (*CacheStatus, e
 	if len(p.files) == 0 {
 		return nil, fmt.Errorf("%w: the selection matched no files", ErrInvalidSelection)
 	}
-	key := taskKey(req.Project, req.Name, local.Commit, p.objects)
 	s.gc()
-
-	var missing []string
-	for _, oid := range p.objects {
-		if !s.git.LFSObjectExists(ctx, oid) {
-			missing = append(missing, oid)
-		}
-	}
-	t, err := s.startOrAttach(key, req.Project, req.Name, local.Commit, missing, p.sizes)
+	key := taskKey(req.Project, req.Name, p.objects)
+	t, err := s.startOrAttach(key, req.Project, req.Name, local.Commit, s.missingObjects(ctx, p.objects), p.sizes)
 	if err != nil {
 		return nil, err
 	}
@@ -198,12 +190,31 @@ func (s *Service) CacheModel(ctx context.Context, req *Request) (*CacheStatus, e
 }
 
 func (s *Service) GetModelCache(ctx context.Context, project, name, revision string) (*CacheStatus, error) {
-	exists, err := s.modelExists(ctx, project, name)
+	m, err := s.models.GetModel(ctx, project, name)
 	if err != nil {
+		if isNotFound(err) {
+			return nil, fmt.Errorf("%w: %s/%s", ErrModelNotFound, project, name)
+		}
 		return nil, err
 	}
-	if !exists {
-		return nil, fmt.Errorf("%w: %s/%s", ErrModelNotFound, project, name)
+	if m.SyncedAt == nil {
+		prj, err := s.projects.GetProjectByName(ctx, project)
+		if err != nil {
+			return nil, err
+		}
+		if prj.HasProxy() {
+			// Until its first sync succeeds, a proxy model holds only the
+			// placeholder commit that creating it wrote: none of its files
+			// are known.
+			return &CacheStatus{
+				Project:           project,
+				Name:              name,
+				RequestedRevision: revision,
+				State:             CacheStateMissing,
+				Files:             []FileStatus{},
+				Warnings:          []string{"the model has not been synced from upstream yet"},
+			}, nil
+		}
 	}
 	local, err := s.listLocal(ctx, project, name, revision)
 	if err != nil {
@@ -214,7 +225,7 @@ func (s *Service) GetModelCache(ctx context.Context, project, name, revision str
 		return nil, err
 	}
 	s.gc()
-	t := s.latestTask(project, name, local.Commit)
+	t := s.latestTask(project, name, local.Commit, p.objects)
 	return s.buildStatus(ctx, project, name, revision, local, p, t, true), nil
 }
 
@@ -227,33 +238,74 @@ func (s *Service) Close() {
 	s.wg.Wait()
 }
 
-// validateRevision rejects refs that are not branches or tags: MatrixHub
-// mirrors only those, so a ref such as refs/pr/1 could be previewed upstream
-// but never pulled.
+// validateRevision accepts the default branch (empty), branch and tag names,
+// and commit ids. MatrixHub mirrors only branches and tags, so a ref such as
+// refs/pr/1 could be previewed upstream but never pulled; and a revision
+// expression such as main~1 would resolve locally but not upstream.
 func validateRevision(revision string) error {
+	if revision == "" {
+		return nil
+	}
 	if strings.HasPrefix(revision, "refs/") &&
 		!strings.HasPrefix(revision, "refs/heads/") &&
 		!strings.HasPrefix(revision, "refs/tags/") {
 		return fmt.Errorf("%w: %s", ErrUnsupportedRevision, revision)
 	}
+	if !isRefName(revision) {
+		return fmt.Errorf("%w: %q is not a branch, tag or commit name", ErrUnsupportedRevision, revision)
+	}
 	return nil
 }
 
-// explainMissingRevision tells a revision that upstream does not have from
-// one it has outside the mirrored branches and tags, such as a commit that is
-// only reachable from a pull request. remote is the upstream listing of the
-// revision when the caller already has it.
-func (s *Service) explainMissingRevision(ctx context.Context, prj *project.Project, reg *registry.Registry, req *Request, remote *git.RevisionFiles, notFound error) error {
+// isRefName applies the rules of git check-ref-format to a branch or tag
+// name; commit ids follow them too.
+func isRefName(name string) bool {
+	if name == "@" || strings.HasPrefix(name, "-") || strings.HasPrefix(name, "/") ||
+		strings.HasSuffix(name, "/") || strings.HasSuffix(name, ".") ||
+		strings.Contains(name, "..") || strings.Contains(name, "//") || strings.Contains(name, "@{") {
+		return false
+	}
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f || strings.ContainsRune(" ~^:?*[\\", r) {
+			return false
+		}
+	}
+	for _, part := range strings.Split(name, "/") {
+		if strings.HasPrefix(part, ".") || strings.HasSuffix(part, ".lock") {
+			return false
+		}
+	}
+	return true
+}
+
+// fetchRevision handles a revision that the mirror does not have, as upstream
+// tells: a revision that upstream does not have either is not found; one that
+// it has is newer than the last sync, which a forced sync fetches, or outside
+// the mirrored branches and tags, such as a commit that only a pull request
+// reaches. Only a revision that upstream has forces a sync, and refresh rate
+// limits those. remote is the upstream listing that a new model was checked
+// with: that model synced just now, so no sync is forced.
+func (s *Service) fetchRevision(ctx context.Context, prj *project.Project, reg *registry.Registry, req *Request, remote *git.RevisionFiles, notFound error) (*git.RevisionFiles, error) {
 	if remote == nil {
 		var err error
 		if remote, err = s.listUpstream(ctx, prj, reg, req.Name, req.Revision); err != nil {
 			if errors.Is(err, ErrRevisionNotFound) {
-				return notFound
+				return nil, notFound
 			}
-			return err
+			return nil, err
+		}
+		if err := s.refresh(ctx, req.Project, req.Name); err != nil {
+			if errors.Is(err, model.ErrModelNotFound) {
+				return nil, fmt.Errorf("%w: %s/%s", ErrModelNotFound, req.Project, req.Name)
+			}
+			return nil, fmt.Errorf("%w: %w", ErrUpstreamSync, err)
+		}
+		local, err := s.listLocal(ctx, req.Project, req.Name, req.Revision)
+		if !errors.Is(err, ErrRevisionNotFound) {
+			return local, err
 		}
 	}
-	return fmt.Errorf("%w: %s resolves to %s upstream", ErrRevisionNotMirrored, revisionLabel(req.Revision), remote.Commit)
+	return nil, fmt.Errorf("%w: %s resolves to %s upstream", ErrRevisionNotMirrored, revisionLabel(req.Revision), remote.Commit)
 }
 
 func revisionLabel(revision string) string {
@@ -321,6 +373,8 @@ func (s *Service) listUpstream(ctx context.Context, prj *project.Project, reg *r
 		return nil, fmt.Errorf("%w: %w", ErrUpstreamAccessDenied, err)
 	case errors.Is(err, registrydiscovery.ErrRemoteUnavailable):
 		return nil, fmt.Errorf("%w: %w", ErrUpstreamUnavailable, err)
+	case errors.Is(err, registrydiscovery.ErrRemoteTooLarge):
+		return nil, fmt.Errorf("%w: %w", ErrTooManyFiles, err)
 	default:
 		return nil, err
 	}
@@ -328,7 +382,7 @@ func (s *Service) listUpstream(ctx context.Context, prj *project.Project, reg *r
 
 func (s *Service) listLocal(ctx context.Context, project, name, revision string) (*git.RevisionFiles, error) {
 	files, err := s.git.ListRevisionFiles(ctx, repoTypeModels, project, name, revision)
-	if err != nil && isNotFound(err) {
+	if errors.Is(err, git.ErrRevisionNotFound) {
 		return nil, fmt.Errorf("%w: %w", ErrRevisionNotFound, err)
 	}
 	return files, err
@@ -341,8 +395,18 @@ func (s *Service) localHasCommit(ctx context.Context, project, name, commit stri
 	if err != nil || !exists {
 		return false
 	}
-	_, err = s.git.ListRevisionFiles(ctx, repoTypeModels, project, name, commit)
-	return err == nil
+	return s.git.HasCommit(ctx, repoTypeModels, project, name, commit)
+}
+
+// missingObjects returns the objects of oids that are not stored.
+func (s *Service) missingObjects(ctx context.Context, oids []string) []string {
+	var missing []string
+	for _, oid := range oids {
+		if !s.git.LFSObjectExists(ctx, oid) {
+			missing = append(missing, oid)
+		}
+	}
+	return missing
 }
 
 func (s *Service) modelExists(ctx context.Context, project, name string) (bool, error) {
@@ -362,18 +426,23 @@ func (s *Service) lookupTask(key string) *task {
 	return s.tasks[key]
 }
 
-// latestTask returns the task of a commit that is running, or else the one
-// started last. Tasks of narrower selections count too.
-func (s *Service) latestTask(project, name, commit string) *task {
+// latestTask returns the task to report for the objects of a commit: one that
+// is running, or else the one started last. Tasks of narrower selections
+// count, and so do running tasks of another commit that pull some of the
+// objects, as after the branch moved during a pull.
+func (s *Service) latestTask(project, name, commit string, objects []string) *task {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var latest *task
 	latestRunning := false
 	for _, t := range s.tasks {
-		if t.project != project || t.name != name || t.commit != commit {
+		if t.project != project || t.name != name {
 			continue
 		}
 		running := t.running()
+		if t.commit != commit && (!running || !t.hasAny(objects)) {
+			continue
+		}
 		if latest == nil ||
 			(running && !latestRunning) ||
 			(running == latestRunning && t.startedAt.After(latest.startedAt)) {
@@ -404,20 +473,25 @@ func (s *Service) runningTasksLocked() int {
 	return running
 }
 
-// startOrAttach returns the running task of key, or starts one for the
-// missing objects. It returns the last finished task, possibly nil, when
-// nothing is missing.
+// startOrAttach returns the running task of key, which retries its failed
+// objects that are still missing, or starts one for the missing objects. When
+// nothing is missing, it returns the last run of key unless that run failed,
+// because the run's failures no longer hold; possibly nil.
 func (s *Service) startOrAttach(key, project, name, commit string, missing []string, sizes map[string]int64) (*task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.ctx.Err() != nil {
 		return nil, ErrClosed
 	}
-	if t, ok := s.tasks[key]; ok && t.running() {
-		return t, nil
+	last := s.tasks[key]
+	if last != nil && last.retry(missing) {
+		return last, nil
 	}
 	if len(missing) == 0 {
-		return s.tasks[key], nil
+		if last != nil && last.failed() {
+			return nil, nil
+		}
+		return last, nil
 	}
 	if running := s.runningTasksLocked(); running >= s.opts.MaxRunningTasks {
 		return nil, fmt.Errorf("%w: %d running", ErrTooManyTasks, running)
@@ -462,9 +536,9 @@ func (s *Service) gc() {
 			delete(s.tasks, key)
 		}
 	}
-	for key, r := range s.lastRequeue {
+	for key, r := range s.lastRefresh {
 		if now.Sub(r.at) > s.opts.FinishedTaskTTL {
-			delete(s.lastRequeue, key)
+			delete(s.lastRefresh, key)
 		}
 	}
 }
@@ -497,6 +571,8 @@ func (s *Service) buildStatus(ctx context.Context, project, name, requested stri
 	for _, f := range p.files {
 		fs := FileStatus{Path: f.Path, Size: f.Size, IsLFS: f.IsLFS, OID: f.OID, State: FileMissing}
 		o, tracked := objects[f.OID]
+		// Storage decides, then a download in progress, of the task or
+		// of another one, and only then the task's failure.
 		switch {
 		case !f.IsLFS:
 			if gitCached {
@@ -504,10 +580,12 @@ func (s *Service) buildStatus(ctx context.Context, project, name, requested stri
 			}
 		case s.git.LFSObjectExists(ctx, f.OID):
 			fs.State = FileCached
-		case tracked && o.state != FileCached:
+		case tracked && (o.state == FileDownloading || o.state == FileQueued):
 			fs.State, fs.DownloadedBytes, fs.Error = o.state, o.downloaded, o.err
 		case hasKey(others, f.OID):
 			fs.State, fs.DownloadedBytes = FileDownloading, others[f.OID]
+		case tracked && o.state == FileFailed:
+			fs.State, fs.Error = FileFailed, o.err
 		}
 		if fs.State == FileQueued && !running {
 			fs.State = FileMissing

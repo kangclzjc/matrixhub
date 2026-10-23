@@ -10,7 +10,7 @@
 package v1alpha1
 
 type ModelsCacheModelBody struct {
-	// Branch, tag or commit. Empty means the default branch. Other refs, such as refs/pr/1, are rejected: MatrixHub mirrors only branches and tags.
+	// Branch, tag or commit. Empty means the default branch. Other refs, such as refs/pr/1, are rejected: MatrixHub mirrors only branches and tags. So are revision expressions such as main~1, which upstream does not resolve.
 	Revision string `json:"revision,omitempty"`
 	// Narrow the cached files; without patterns every file of the revision is cached. Patterns follow huggingface_hub fnmatch semantics: '*' and '?' also match '/', and a trailing '/' selects a whole directory. A list holds at most 16 patterns, and a pattern at most 256 characters and 16 wildcards ('*', '?' and classes).
 	AllowPatterns []string `json:"allowPatterns,omitempty"`
