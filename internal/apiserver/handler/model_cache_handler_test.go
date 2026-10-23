@@ -33,6 +33,7 @@ import (
 	authzmocks "github.com/matrixhub-ai/matrixhub/internal/domain/authz/mocks"
 	"github.com/matrixhub-ai/matrixhub/internal/domain/modelcache"
 	modelcachemocks "github.com/matrixhub-ai/matrixhub/internal/domain/modelcache/mocks"
+	"github.com/matrixhub-ai/matrixhub/internal/domain/registrydiscovery"
 	"github.com/matrixhub-ai/matrixhub/internal/domain/role"
 )
 
@@ -147,6 +148,21 @@ func TestModelCacheHandlersRejectInvalidRequests(t *testing.T) {
 	}
 }
 
+// Hugging Face repository names may start with '_', unlike the names that
+// CreateModel accepts.
+func TestModelCacheHandlersAcceptNamesStartingWithAnUnderscore(t *testing.T) {
+	f := newCacheHandler(t)
+	f.expectPermission(role.ModelPush, true)
+	f.expectPermission(role.ModelGet, true)
+	f.cache.EXPECT().CacheModel(gomock.Any(), gomock.Any()).Return(missingStatus, nil)
+	f.cache.EXPECT().GetModelCache(gomock.Any(), "proj", "_tiny", "").Return(missingStatus, nil)
+
+	_, err := f.handler.CacheModel(t.Context(), &modelv1alpha1.CacheModelRequest{Project: "proj", Name: "_tiny", DryRun: true})
+	require.NoError(t, err)
+	_, err = f.handler.GetModelCache(t.Context(), &modelv1alpha1.GetModelCacheRequest{Project: "proj", Name: "_tiny"})
+	require.NoError(t, err)
+}
+
 func TestModelCacheHandlersMapErrors(t *testing.T) {
 	// Errors from local storage and syncs can name server paths.
 	storageErr := errors.New("repository does not exist at /data/repositories/proj/model.git")
@@ -163,6 +179,7 @@ func TestModelCacheHandlersMapErrors(t *testing.T) {
 		{fmt.Errorf("%w: proj", modelcache.ErrNotProxyProject), codes.FailedPrecondition},
 		{fmt.Errorf("%w: gated", modelcache.ErrUpstreamAccessDenied), codes.FailedPrecondition},
 		{fmt.Errorf("%w: rate limited", modelcache.ErrUpstreamUnavailable), codes.Unavailable},
+		{fmt.Errorf("%w: more than 100 pages", modelcache.ErrTooManyFiles), codes.FailedPrecondition},
 		// An upstream timeout is not the request's deadline.
 		{fmt.Errorf("%w: %w", modelcache.ErrUpstreamUnavailable, context.DeadlineExceeded), codes.Unavailable},
 		{modelcache.ErrClosed, codes.Unavailable},
@@ -202,6 +219,42 @@ func TestCacheModelReportsAnEndedRequest(t *testing.T) {
 	_, err := f.handler.CacheModel(ctx, &modelv1alpha1.CacheModelRequest{Project: "proj", Name: "model"})
 
 	require.Equal(t, codes.Canceled, status.Code(err))
+}
+
+// Upstream failures name upstream URLs and network details, which a client
+// does not see; the reasons a user can act on stay.
+func TestModelCacheHandlersHideUpstreamDetails(t *testing.T) {
+	const detail = `Get "http://10.0.0.7/api/models/Org/m": dial tcp 10.0.0.7:80: connect: connection refused`
+	tests := []struct {
+		err  error
+		want string
+	}{
+		{
+			fmt.Errorf("%w: %w", modelcache.ErrUpstreamUnavailable, fmt.Errorf("%w: %s", registrydiscovery.ErrRemoteUnavailable, detail)),
+			"upstream registry unavailable",
+		},
+		{
+			fmt.Errorf("%w: %w", modelcache.ErrUpstreamUnavailable,
+				fmt.Errorf("%w: %w; retry after 30s (http://10.0.0.7/api)", registrydiscovery.ErrRemoteUnavailable, registrydiscovery.ErrRemoteRateLimited)),
+			"upstream registry unavailable: rate limited",
+		},
+		{
+			fmt.Errorf("%w: %w", modelcache.ErrUpstreamAccessDenied,
+				fmt.Errorf("%w: %w (http://10.0.0.7/api)", registrydiscovery.ErrRemoteAccessDenied, registrydiscovery.ErrRemoteGated)),
+			"upstream registry denied access: gated repository needs an authorized credential",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.want, func(t *testing.T) {
+			f := newCacheHandler(t)
+			f.expectPermission(role.ModelPush, true)
+			f.cache.EXPECT().CacheModel(gomock.Any(), gomock.Any()).Return(nil, tt.err)
+
+			_, err := f.handler.CacheModel(t.Context(), &modelv1alpha1.CacheModelRequest{Project: "proj", Name: "model", DryRun: true})
+
+			require.Equal(t, tt.want, status.Convert(err).Message())
+		})
+	}
 }
 
 func requireStatus(t *testing.T, err error, want codes.Code) {

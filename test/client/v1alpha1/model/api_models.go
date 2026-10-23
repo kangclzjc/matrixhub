@@ -31,7 +31,7 @@ type ModelsApiService service
 ModelsApiService CacheModel pulls a revision of a proxy-project model from upstream into MatrixHub storage on the server. The model may not exist locally yet. With dry_run it only lists the upstream files and reports what is already cached: it never syncs, creates the model, or starts downloads.
  * @param ctx context.Context - for authentication, logging, cancellation, deadlines, tracing, etc. Passed from http.Request or context.Background().
  * @param project
- * @param name
+ * @param name Name of the model. As on Hugging Face, it may start with &#39;_&#39;.
  * @param body
 
 @return V1alpha1ModelCacheStatus
@@ -543,7 +543,7 @@ func (a *ModelsApiService) ModelsGetModelBlob(ctx context.Context, project strin
 ModelsApiService GetModelCache reports the local cache status of every file of a model revision, and the latest pull of that commit. It is read-only: it never contacts upstream and never starts downloads.
  * @param ctx context.Context - for authentication, logging, cancellation, deadlines, tracing, etc. Passed from http.Request or context.Background().
  * @param project
- * @param name
+ * @param name Name of the model. As on Hugging Face, it may start with &#39;_&#39;.
  * @param optional nil or *ModelsApiModelsGetModelCacheOpts - Optional Parameters:
      * @param "Revision" (optional.String) -  Branch, tag or commit. Empty means the default branch.
 

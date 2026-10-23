@@ -23,6 +23,7 @@ import (
 
 	modelv1alpha1 "github.com/matrixhub-ai/matrixhub/api/go/v1alpha1"
 	"github.com/matrixhub-ai/matrixhub/internal/domain/modelcache"
+	"github.com/matrixhub-ai/matrixhub/internal/domain/registrydiscovery"
 	"github.com/matrixhub-ai/matrixhub/internal/domain/role"
 	"github.com/matrixhub-ai/matrixhub/internal/infra/log"
 )
@@ -68,9 +69,10 @@ func (mh *ModelHandler) GetModelCache(ctx context.Context, request *modelv1alpha
 }
 
 // modelCacheErrorToStatus maps service errors to gRPC statuses. Errors that
-// wrap local storage or sync failures can carry server paths, so they are
-// logged and answered with the sentinel message only. A request that ended
-// is reported as such first: its error is not a failure of upstream.
+// wrap local storage, sync or upstream failures can carry server paths,
+// upstream URLs or network details, so they are logged and answered with the
+// sentinel message only. A request that ended is reported as such first: its
+// error is not a failure of upstream.
 func modelCacheErrorToStatus(ctx context.Context, err error) error {
 	switch ctxErr := ctx.Err(); {
 	case errors.Is(ctxErr, context.Canceled):
@@ -91,10 +93,18 @@ func modelCacheErrorToStatus(ctx context.Context, err error) error {
 		log.Warnf("model cache: %v", err)
 		return status.Error(codes.Unavailable, modelcache.ErrUpstreamSync.Error())
 	case errors.Is(err, modelcache.ErrNotProxyProject),
-		errors.Is(err, modelcache.ErrRevisionNotMirrored),
-		errors.Is(err, modelcache.ErrUpstreamAccessDenied):
+		errors.Is(err, modelcache.ErrRevisionNotMirrored):
 		return status.Error(codes.FailedPrecondition, err.Error())
-	case errors.Is(err, modelcache.ErrUpstreamUnavailable), errors.Is(err, modelcache.ErrClosed):
+	case errors.Is(err, modelcache.ErrUpstreamAccessDenied):
+		log.Infof("model cache: %v", err)
+		return status.Error(codes.FailedPrecondition, upstreamMessage(modelcache.ErrUpstreamAccessDenied, err))
+	case errors.Is(err, modelcache.ErrTooManyFiles):
+		log.Infof("model cache: %v", err)
+		return status.Error(codes.FailedPrecondition, modelcache.ErrTooManyFiles.Error())
+	case errors.Is(err, modelcache.ErrUpstreamUnavailable):
+		log.Warnf("model cache: %v", err)
+		return status.Error(codes.Unavailable, upstreamMessage(modelcache.ErrUpstreamUnavailable, err))
+	case errors.Is(err, modelcache.ErrClosed):
 		return status.Error(codes.Unavailable, err.Error())
 	case errors.Is(err, modelcache.ErrTooManyTasks):
 		return status.Error(codes.ResourceExhausted, err.Error())
@@ -102,6 +112,17 @@ func modelCacheErrorToStatus(ctx context.Context, err error) error {
 		log.Errorf("model cache operation failed: %v", err)
 		return status.Error(codes.Internal, "model cache operation failed")
 	}
+}
+
+// upstreamMessage is the message of an upstream failure: its sentinel and,
+// for the failures that a user can act on, the reason.
+func upstreamMessage(sentinel, err error) string {
+	for _, reason := range []error{registrydiscovery.ErrRemoteGated, registrydiscovery.ErrRemoteRateLimited} {
+		if errors.Is(err, reason) {
+			return sentinel.Error() + ": " + reason.Error()
+		}
+	}
+	return sentinel.Error()
 }
 
 func cacheFileStateToProto(s modelcache.FileState) modelv1alpha1.CacheFileState {

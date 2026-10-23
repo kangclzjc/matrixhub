@@ -307,6 +307,7 @@
           },
           {
             "name": "name",
+            "description": "Name of the model. As on Hugging Face, it may start with '_'.",
             "in": "path",
             "required": true,
             "type": "string"
@@ -349,6 +350,7 @@
           },
           {
             "name": "name",
+            "description": "Name of the model. As on Hugging Face, it may start with '_'.",
             "in": "path",
             "required": true,
             "type": "string"
@@ -607,7 +609,7 @@
       "properties": {
         "revision": {
           "type": "string",
-          "description": "Branch, tag or commit. Empty means the default branch. Other refs, such as\nrefs/pr/1, are rejected: MatrixHub mirrors only branches and tags."
+          "description": "Branch, tag or commit. Empty means the default branch. Other refs, such as\nrefs/pr/1, are rejected: MatrixHub mirrors only branches and tags. So are\nrevision expressions such as main~1, which upstream does not resolve."
         },
         "allowPatterns": {
           "type": "array",

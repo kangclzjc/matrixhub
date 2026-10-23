@@ -62,15 +62,6 @@ var _ = Describe("Model cache", Label("model", "model-cache"), func() {
 			Expect(err).To(HaveOccurred())
 			Expect(resp.StatusCode).To(Equal(http.StatusNotFound))
 		})
-
-		It("should reject more than 16 patterns", Label("M00064"), func() {
-			_, resp, err := modelsApi.ModelsCacheModel(ctx, projectName, "model", v1alpha1model.ModelsCacheModelBody{
-				DryRun:         true,
-				IgnorePatterns: slices.Repeat([]string{"*.bin"}, 17),
-			})
-			Expect(err).To(HaveOccurred())
-			Expect(resp.StatusCode).To(Equal(http.StatusBadRequest))
-		})
 	})
 
 	Context("in a proxy project", func() {
@@ -101,6 +92,9 @@ var _ = Describe("Model cache", Label("model", "model-cache"), func() {
 			var viewerID int32
 			viewerID, viewerCookie, err = tools.CreateUserAndLoginWithID(tools.GenerateTestUsername("m-cache-viewer"), "Test@123456", false)
 			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(func() {
+				_ = tools.DeleteUser(int64(viewerID))
+			})
 			memberType := v1alpha1project.USER_V1alpha1MemberType
 			viewerRole := v1alpha1project.VIEWER_V1alpha1ProjectRoleType
 			_, _, err = projectsApi.ProjectsAddProjectMemberWithRole(ctx, projectName, v1alpha1project.ProjectsAddProjectMemberWithRoleBody{
@@ -109,6 +103,17 @@ var _ = Describe("Model cache", Label("model", "model-cache"), func() {
 				Role:       &viewerRole,
 			})
 			Expect(err).NotTo(HaveOccurred())
+		})
+
+		// In a proxy project the same dry run would list upstream, so only
+		// the limit rejects it.
+		It("should reject more than 16 patterns", Label("M00064"), func() {
+			_, resp, err := modelsApi.ModelsCacheModel(ctx, projectName, "gpt2", v1alpha1model.ModelsCacheModelBody{
+				DryRun:         true,
+				IgnorePatterns: slices.Repeat([]string{"*.bin"}, 17),
+			})
+			Expect(err).To(HaveOccurred())
+			Expect(resp.StatusCode).To(Equal(http.StatusBadRequest))
 		})
 
 		It("should not let a viewer preview or start a pull", Label("M00065"), func() {

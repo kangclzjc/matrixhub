@@ -24,13 +24,14 @@ import (
 // pattern.
 const maxPatternWildcards = 16
 
-// maxMatchSteps bounds the runes that matching compares for one plan, about a
-// second of work. Finding a segment costs up to the path length times the
-// segment length, so long literal patterns against many long paths could
-// otherwise keep the server busy for minutes.
+// maxMatchSteps bounds the comparisons that matching makes for one plan, well
+// under a second of work. Finding a segment costs up to the path length times
+// the segment length, and a character class compares a rune with each of its
+// ranges, so long patterns against many long paths could otherwise keep the
+// server busy for minutes.
 const maxMatchSteps = 500_000_000
 
-// matchBudget counts the runes that matching compares.
+// matchBudget counts the comparisons that matching makes.
 type matchBudget struct {
 	steps, max int
 }
@@ -64,6 +65,14 @@ type runeMatcher struct {
 	ranges []runeRange
 }
 
+// cost is the number of comparisons that match makes at most.
+func (m *runeMatcher) cost() int {
+	if m.kind == matchClass && len(m.ranges) > 1 {
+		return len(m.ranges)
+	}
+	return 1
+}
+
 func (m *runeMatcher) match(r rune) bool {
 	switch m.kind {
 	case matchAnyRune:
@@ -84,12 +93,15 @@ func compileGlob(pattern string) (*glob, error) {
 	if !utf8.ValidString(pattern) {
 		return nil, fmt.Errorf("%w: pattern %q is not valid UTF-8", ErrInvalidSelection, pattern)
 	}
-	if strings.HasSuffix(pattern, "/") {
-		pattern += "*"
-	}
-	runes := []rune(pattern)
-	g := &glob{segments: [][]runeMatcher{nil}}
+	body := pattern
 	wildcards := 0
+	if strings.HasSuffix(body, "/") {
+		// The '*' that selects the directory's files is not the user's.
+		body += "*"
+		wildcards--
+	}
+	runes := []rune(body)
+	g := &glob{segments: [][]runeMatcher{nil}}
 	for i := 0; i < len(runes); i++ {
 		last := len(g.segments) - 1
 		switch r := runes[i]; r {
@@ -109,11 +121,7 @@ func compileGlob(pattern string) (*glob, error) {
 				g.segments[last] = append(g.segments[last], runeMatcher{r: r})
 				continue
 			}
-			m, err := parseClass(runes[i+1 : end])
-			if err != nil {
-				return nil, fmt.Errorf("%w: pattern %q: %v", ErrInvalidSelection, pattern, err)
-			}
-			g.segments[last] = append(g.segments[last], m)
+			g.segments[last] = append(g.segments[last], parseClass(runes[i+1:end]))
 			wildcards++
 			i = end
 		default:
@@ -146,8 +154,10 @@ func classEnd(runes []rune, start int) int {
 }
 
 // parseClass parses the body of a class: a leading '!' negates it and "a-z" is
-// a range. As in fnmatch, '^' and '\' are literals.
-func parseClass(body []rune) (runeMatcher, error) {
+// a range. As in fnmatch, '^' and '\' are literals, and a reversed range such
+// as "z-a" is dropped: a class left empty matches nothing, or, negated, any
+// rune.
+func parseClass(body []rune) runeMatcher {
 	m := runeMatcher{kind: matchClass}
 	if len(body) > 0 && body[0] == '!' {
 		m.negate = true
@@ -160,15 +170,15 @@ func parseClass(body []rune) (runeMatcher, error) {
 			i += 2
 		}
 		if hi < lo {
-			return m, fmt.Errorf("invalid range %c-%c", lo, hi)
+			continue
 		}
 		m.ranges = append(m.ranges, runeRange{lo: lo, hi: hi})
 	}
-	return m, nil
+	return m
 }
 
-// match reports whether path matches the pattern. It charges the runes it
-// compares to b and gives up, returning false, once b is exceeded.
+// match reports whether path matches the pattern. It charges the comparisons
+// it makes to b and gives up, returning false, once b is exceeded.
 func (g *glob) match(path []rune, b *matchBudget) bool {
 	if len(g.segments) == 1 {
 		return len(path) == len(g.segments[0]) && matchAt(g.segments[0], path, 0, b)
@@ -194,12 +204,11 @@ func (g *glob) match(path []rune, b *matchBudget) bool {
 
 func matchAt(seg []runeMatcher, path []rune, at int, b *matchBudget) bool {
 	for i := range seg {
+		b.steps += seg[i].cost()
 		if !seg[i].match(path[at+i]) {
-			b.steps += i + 1
 			return false
 		}
 	}
-	b.steps += len(seg)
 	return true
 }
 

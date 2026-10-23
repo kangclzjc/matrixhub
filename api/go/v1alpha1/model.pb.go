@@ -1988,9 +1988,11 @@ func (*UpdateModelSettingResponse) Descriptor() ([]byte, []int) {
 type CacheModelRequest struct {
 	state   protoimpl.MessageState `protogen:"open.v1"`
 	Project string                 `protobuf:"bytes,1,opt,name=project,proto3" json:"project,omitempty"`
-	Name    string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
+	// Name of the model. As on Hugging Face, it may start with '_'.
+	Name string `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
 	// Branch, tag or commit. Empty means the default branch. Other refs, such as
-	// refs/pr/1, are rejected: MatrixHub mirrors only branches and tags.
+	// refs/pr/1, are rejected: MatrixHub mirrors only branches and tags. So are
+	// revision expressions such as main~1, which upstream does not resolve.
 	Revision string `protobuf:"bytes,3,opt,name=revision,proto3" json:"revision,omitempty"`
 	// Narrow the cached files; without patterns every file of the revision is
 	// cached. Patterns follow huggingface_hub fnmatch semantics: '*' and '?'
@@ -2084,7 +2086,8 @@ func (x *CacheModelRequest) GetDryRun() bool {
 type GetModelCacheRequest struct {
 	state   protoimpl.MessageState `protogen:"open.v1"`
 	Project string                 `protobuf:"bytes,1,opt,name=project,proto3" json:"project,omitempty"`
-	Name    string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
+	// Name of the model. As on Hugging Face, it may start with '_'.
+	Name string `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
 	// Branch, tag or commit. Empty means the default branch.
 	Revision      string `protobuf:"bytes,3,opt,name=revision,proto3" json:"revision,omitempty"`
 	unknownFields protoimpl.UnknownFields
@@ -2679,17 +2682,17 @@ const file_v1alpha1_model_proto_rawDesc = "" +
 	"\aproject\x18\x01 \x01(\tB\a\xfaB\x04r\x02\x10\x01R\aproject\x12>\n" +
 	"\x04name\x18\x02 \x01(\tB*\xfaB'r%\x10\x01Z\x06modelsZ\bdatasetsZ\x06spacesZ\aresolveR\x04name\x124\n" +
 	"\apopular\x18\x03 \x01(\v2\x1a.google.protobuf.BoolValueR\apopular\"\x1c\n" +
-	"\x1aUpdateModelSettingResponse\"\xcc\x02\n" +
+	"\x1aUpdateModelSettingResponse\"\xcd\x02\n" +
 	"\x11CacheModelRequest\x12!\n" +
-	"\aproject\x18\x01 \x01(\tB\a\xfaB\x04r\x02\x10\x01R\aproject\x12_\n" +
-	"\x04name\x18\x02 \x01(\tBK\xfaBHrF\x10\x01\x18\xfb\x012\x1c^[A-Za-z0-9][A-Za-z0-9_.-]*$Z\x06modelsZ\bdatasetsZ\x06spacesZ\aresolveR\x04name\x12$\n" +
+	"\aproject\x18\x01 \x01(\tB\a\xfaB\x04r\x02\x10\x01R\aproject\x12`\n" +
+	"\x04name\x18\x02 \x01(\tBL\xfaBIrG\x10\x01\x18\xfb\x012\x1d^[A-Za-z0-9_][A-Za-z0-9_.-]*$Z\x06modelsZ\bdatasetsZ\x06spacesZ\aresolveR\x04name\x12$\n" +
 	"\brevision\x18\x03 \x01(\tB\b\xfaB\x05r\x03\x18\xff\x01R\brevision\x128\n" +
 	"\x0eallow_patterns\x18\x04 \x03(\tB\x11\xfaB\x0e\x92\x01\v\x10\x10\"\ar\x05\x10\x01\x18\x80\x02R\rallowPatterns\x12:\n" +
 	"\x0fignore_patterns\x18\x05 \x03(\tB\x11\xfaB\x0e\x92\x01\v\x10\x10\"\ar\x05\x10\x01\x18\x80\x02R\x0eignorePatterns\x12\x17\n" +
-	"\adry_run\x18\x06 \x01(\bR\x06dryRun\"\xc0\x01\n" +
+	"\adry_run\x18\x06 \x01(\bR\x06dryRun\"\xc1\x01\n" +
 	"\x14GetModelCacheRequest\x12!\n" +
-	"\aproject\x18\x01 \x01(\tB\a\xfaB\x04r\x02\x10\x01R\aproject\x12_\n" +
-	"\x04name\x18\x02 \x01(\tBK\xfaBHrF\x10\x01\x18\xfb\x012\x1c^[A-Za-z0-9][A-Za-z0-9_.-]*$Z\x06modelsZ\bdatasetsZ\x06spacesZ\aresolveR\x04name\x12$\n" +
+	"\aproject\x18\x01 \x01(\tB\a\xfaB\x04r\x02\x10\x01R\aproject\x12`\n" +
+	"\x04name\x18\x02 \x01(\tBL\xfaBIrG\x10\x01\x18\xfb\x012\x1d^[A-Za-z0-9_][A-Za-z0-9_.-]*$Z\x06modelsZ\bdatasetsZ\x06spacesZ\aresolveR\x04name\x12$\n" +
 	"\brevision\x18\x03 \x01(\tB\b\xfaB\x05r\x03\x18\xff\x01R\brevision\"\xd7\x01\n" +
 	"\x0eModelCacheFile\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12\x12\n" +
