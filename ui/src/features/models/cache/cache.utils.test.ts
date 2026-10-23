@@ -317,9 +317,24 @@ describe('isFinishedTaskState', () => {
 })
 
 describe('resolveModelCacheIndicator', () => {
-  it('shows nothing without a status or files', () => {
+  it('shows nothing without a status or for a revision without files', () => {
     expect(resolveModelCacheIndicator(undefined)).toBeUndefined()
-    expect(resolveModelCacheIndicator(cacheStatus({ files: '0' }, { state: MISSING }))).toBeUndefined()
+    expect(resolveModelCacheIndicator(cacheStatus({ files: '0' }, { state: CACHED }))).toBeUndefined()
+  })
+
+  // Until the first sync of a proxy model succeeds, the server knows none of its files.
+  it('shows a model that has not synced yet as not cached', () => {
+    expect(resolveModelCacheIndicator(cacheStatus({
+      files: '0',
+      bytes: '0',
+    }, {
+      state: MISSING,
+      files: [],
+    }))).toEqual({
+      state: 'uncached',
+      percent: 0,
+      belowOnePercent: false,
+    })
   })
 
   it('reports a cached model as complete', () => {

@@ -163,12 +163,15 @@ export function getCacheStatusPollInterval(
   return isTaskRunning(data) ? CACHE_STATUS_POLL_INTERVAL_MS : false
 }
 
-/** Returns undefined when there is nothing to show: no status yet, or a revision without files. */
+/**
+ * Returns undefined when there is nothing to show: no status yet, or a revision without files.
+ * A proxy model that has not synced yet lists no files either, but it shows as not cached.
+ */
 export function resolveModelCacheIndicator(status: ModelCacheStatus | null | undefined): ModelCacheIndicatorState | undefined {
   const state = resolveModelCacheState(status)
   const progress = computeCacheProgress(status)
 
-  if (state === 'unknown' || progress.totalFiles === 0) {
+  if (state === 'unknown' || (progress.totalFiles === 0 && state !== 'uncached')) {
     return undefined
   }
 

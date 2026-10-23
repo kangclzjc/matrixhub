@@ -13,7 +13,7 @@ import { useStore } from '@tanstack/react-form'
 import { useNavigate } from '@tanstack/react-router'
 import { useTranslation } from 'react-i18next'
 
-import { createModelSchema } from '@/features/models/models.schema'
+import { createUpstreamModelNameSchema } from '@/features/models/models.schema'
 import {
   DownloadDrawer,
   DownloadDrawerBody,
@@ -94,7 +94,7 @@ function ProxyProjectDownloadForm({
       revision: '',
     },
   })
-  const { name: modelNameSchema } = createModelSchema(t).shape
+  const modelNameSchema = createUpstreamModelNameSchema(t)
   const modelName = useStore(form.store, state => state.values.modelName.trim())
   // The field validates on change, so a name without errors is one the server accepts.
   const modelNameValid = useStore(form.store, state => (state.fieldMeta.modelName?.errors.length ?? 0) === 0)

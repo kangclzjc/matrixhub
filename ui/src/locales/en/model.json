@@ -184,7 +184,7 @@
       "permissionDenied": "You do not have permission to pull models into this project.",
       "unauthenticated": "Your session has expired. Sign in again.",
       "invalidArgument": "The request is invalid. Check the model name and the revision.",
-      "failedPrecondition": "The model cannot be pulled right now. It may require authorized access, the upstream sync failed, or the revision is not on a branch or tag.",
+      "failedPrecondition": "The model cannot be pulled. It may require authorized access, the revision may not be on a branch or tag, or the revision may have too many files.",
       "unavailable": "The upstream registry is unreachable. Try again later.",
       "unknown": "Failed to check the model."
     },

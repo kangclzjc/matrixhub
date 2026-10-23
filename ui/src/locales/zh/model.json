@@ -184,7 +184,7 @@
       "permissionDenied": "没有权限向当前项目拉取模型",
       "unauthenticated": "登录已过期，请重新登录",
       "invalidArgument": "请求无效，请检查模型名称和版本",
-      "failedPrecondition": "暂时无法拉取该模型：可能需要授权访问、上游同步失败，或该版本不在任何分支或标签上",
+      "failedPrecondition": "无法拉取该模型：可能需要授权访问、该版本不在任何分支或标签上，或该版本的文件数量超出上限",
       "unavailable": "上游仓库暂时无法访问，请稍后重试",
       "unknown": "检查模型失败"
     },
