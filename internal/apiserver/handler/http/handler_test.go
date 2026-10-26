@@ -62,7 +62,7 @@ func TestHTTPHandler(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(repoPath), 0755); err != nil {
 		t.Fatalf("Failed to create repos dir: %v", err)
 	}
-	runGitCmd(t, "", "init", "--bare", repoPath)
+	runGitCmd(t, "", "init", "--bare", "--initial-branch=master", repoPath)
 
 	// Set up upstream HTTP handler
 	upstreamHandler := backendhttp.NewHandler(
@@ -141,7 +141,7 @@ func TestHTTPHandlerAuthHook(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(repoPath), 0755); err != nil {
 		t.Fatalf("Failed to create repos dir: %v", err)
 	}
-	runGitCmd(t, "", "init", "--bare", repoPath)
+	runGitCmd(t, "", "init", "--bare", "--initial-branch=master", repoPath)
 
 	t.Run("AuthHookAllowsRead", func(t *testing.T) {
 		// Auth hook that allows all operations

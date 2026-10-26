@@ -16,7 +16,9 @@ package git_ssh_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"time"
 
@@ -119,6 +121,37 @@ var _ = Describe("Git over SSH", Label("git-ssh"), func() {
 		runGitSuccessfully(cloneDir, sshClient.GitEnvironment(), "commit", "-m", "viewer write")
 		push := runGit(cloneDir, sshClient.GitEnvironment(), "push", "origin", "main")
 		Expect(push.Err).To(HaveOccurred(), "viewer push unexpectedly succeeded")
+	})
+
+	// TODO: Re-enable after Git LFS HTTP authentication works for SSH remotes.
+	PIt("should push and clone Git LFS content over SSH", Label("GS00004", "lfs", "slow"), func() {
+		if _, err := exec.LookPath("git-lfs"); err != nil {
+			if os.Getenv("CI") != "" {
+				Fail("git-lfs is required in CI")
+			}
+			Skip("git-lfs is not installed")
+		}
+
+		model := tools.GenerateTestModelName("git-lfs")
+		remote, source := createAndCloneModelRepository(ctx, fixture, sshClient, root, model, "lfs-source")
+		runGitSuccessfully(source, sshClient.GitEnvironment(), "lfs", "install", "--local")
+		runGitSuccessfully(source, sshClient.GitEnvironment(), "lfs", "track", "*.bin")
+
+		payload := make([]byte, 1024*1024)
+		for i := range payload {
+			payload[i] = byte(i % 251)
+		}
+		expectedHash := sha256.Sum256(payload)
+		Expect(os.WriteFile(filepath.Join(source, "weights.bin"), payload, 0600)).To(Succeed())
+		runGitSuccessfully(source, sshClient.GitEnvironment(), "add", ".gitattributes", "weights.bin")
+		runGitSuccessfully(source, sshClient.GitEnvironment(), "commit", "-m", "add LFS payload")
+		runGitSuccessfully(source, sshClient.GitEnvironment(), "push", "-u", "origin", "main")
+
+		cloneDir := filepath.Join(root, "lfs-clone")
+		runGitSuccessfully(root, sshClient.GitEnvironment(), "clone", remote, cloneDir)
+		cloned, err := os.ReadFile(filepath.Join(cloneDir, "weights.bin"))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(sha256.Sum256(cloned)).To(Equal(expectedHash))
 	})
 
 	It("should push branches and tags over SSH", Label("GS00005"), func() {

@@ -200,14 +200,16 @@ Run all unit tests from the repository root:
 make test.unit
 ```
 
-`make test.unit` temporarily excludes `./internal/apiserver/handler/hf`; 
-add that package back after the HF handler tests are fixed.
-
 Run unit tests with coverage:
 
 ```bash
 make test.unit.coverage
 ```
+
+The unit-test workflow uploads `coverage.out` to Codecov. Maintainers must enable
+the repository in Codecov and add its repository upload token as the
+`CODECOV_TOKEN` GitHub Actions secret so protected-branch uploads are accepted.
+Uploads from public fork pull requests can use Codecov's tokenless flow.
 
 For focused package runs while iterating:
 
@@ -223,10 +225,10 @@ unit-test package roots:
 UNIT_TEST_PKGS="./cmd/... ./internal/... ./pkg/..." make test.unit
 ```
 
-Override `UNIT_TEST_EXCLUDE_PKGS` to change the temporary exclusions:
+Set `UNIT_TEST_EXCLUDE_PKGS` to exclude selected package roots when needed:
 
 ```bash
-UNIT_TEST_EXCLUDE_PKGS= make test.unit
+UNIT_TEST_EXCLUDE_PKGS="./internal/apiserver/handler/hf" make test.unit
 ```
 
 When interfaces change, regenerate mocks before running or committing tests:

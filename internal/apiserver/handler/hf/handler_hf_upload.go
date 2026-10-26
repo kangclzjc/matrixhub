@@ -415,7 +415,12 @@ func (h *Handler) handleCommit(w http.ResponseWriter, r *http.Request) {
 		ParentCommit: header.ParentCommit,
 	}
 
-	commitHash, err := h.modelService.CreateModelCommit(r.Context(), ri.Namespace, ri.Name, rev, commit, ops)
+	var commitHash string
+	if ri.RepoType == "models" {
+		commitHash, err = h.modelService.CreateModelCommit(r.Context(), ri.Namespace, ri.Name, rev, commit, ops)
+	} else {
+		commitHash, err = h.gitRepo.CreateCommit(r.Context(), ri.RepoType, ri.Namespace, ri.Name, rev, commit, ops)
+	}
 	if err != nil {
 		responseJSON(w, fmt.Errorf("failed to create commit in repository %q: %v", ri.RepoName, err), http.StatusInternalServerError)
 		return
