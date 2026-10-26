@@ -15,9 +15,11 @@
 package modelcache
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"path"
 	"slices"
 	"strings"
 
@@ -27,8 +29,13 @@ import (
 // weightExts identify weight-like files, used to warn about selections that
 // keep none of them.
 var weightExts = []string{
-	".safetensors", ".bin", ".pt", ".pth", ".ckpt", ".gguf", ".ggml", ".onnx", ".h5", ".msgpack",
+	".safetensors", ".bin", ".pt", ".pth", ".ckpt", ".gguf", ".ggml", ".onnx", ".onnx_data", ".h5",
+	".msgpack", ".ot", ".tflite", ".mlmodel", ".nemo", ".pdparams", ".engine",
 }
+
+// planCheckEvery is how many files a plan matches between checks of its
+// context.
+const planCheckEvery = 256
 
 type compiledSelection struct {
 	allow  []*glob
@@ -72,16 +79,19 @@ type plan struct {
 
 // plan applies the allow patterns (none means everything), then the ignore
 // patterns. It fails with ErrInvalidSelection when matching the patterns
-// against the files would take too long.
-func (c *compiledSelection) plan(files []git.RevisionFile) (*plan, error) {
+// against the files would take too long, and stops when ctx ends.
+func (c *compiledSelection) plan(ctx context.Context, files []git.RevisionFile) (*plan, error) {
 	sorted := slices.Clone(files)
 	slices.SortFunc(sorted, func(a, b git.RevisionFile) int { return strings.Compare(a.Path, b.Path) })
 
 	p := &plan{sizes: map[string]int64{}}
 	budget := &matchBudget{max: c.maxSteps}
 	hasWeights, selectedWeights := false, false
-	for _, f := range sorted {
-		weight := hasAnySuffix(f.Path, weightExts)
+	for i, f := range sorted {
+		if i%planCheckEvery == 0 && ctx.Err() != nil {
+			return nil, context.Cause(ctx)
+		}
+		weight := isWeight(f.Path)
 		hasWeights = hasWeights || weight
 		selected := c.selects(f.Path, budget)
 		if budget.exceeded() {
@@ -113,16 +123,28 @@ func (c *compiledSelection) selects(path string, b *matchBudget) bool {
 	if len(c.allow) == 0 && len(c.ignore) == 0 {
 		return true
 	}
-	runes := []rune(path)
+	runes := []rune(normalizeSeparators(path))
 	if len(c.allow) > 0 && !matchAny(c.allow, runes, b) {
 		return false
 	}
 	return !matchAny(c.ignore, runes, b)
 }
 
-func hasAnySuffix(p string, suffixes []string) bool {
-	for _, s := range suffixes {
-		if strings.HasSuffix(p, s) {
+// normalizeSeparators treats '\' as '/' in patterns and paths, as
+// huggingface_hub does: repository paths always use '/', and '\' is no escape
+// in fnmatch, so patterns written with Windows separators match as intended.
+func normalizeSeparators(s string) string {
+	return strings.ReplaceAll(s, `\`, "/")
+}
+
+// isWeight reports whether p looks like a weight file. training_args.bin, which
+// the Trainer of transformers saves next to the weights, holds none.
+func isWeight(p string) bool {
+	if path.Base(p) == "training_args.bin" {
+		return false
+	}
+	for _, ext := range weightExts {
+		if strings.HasSuffix(p, ext) {
 			return true
 		}
 	}
@@ -146,5 +168,5 @@ func taskKey(project, name string, objects []string) string {
 	sorted := slices.Clone(objects)
 	slices.Sort(sorted)
 	sum := sha256.Sum256([]byte(strings.Join(sorted, "\n")))
-	return project + "/" + name + "#" + hex.EncodeToString(sum[:])[:16]
+	return project + "/" + name + "#" + hex.EncodeToString(sum[:])
 }

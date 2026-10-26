@@ -19,6 +19,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -37,6 +38,9 @@ var (
 	errModelGone      = errors.New("the model was deleted")
 	errResyncFailed   = errors.New("refreshing the model from upstream failed; see server logs for details")
 )
+
+// errPanicked reports a panic that a background goroutine recovered from.
+var errPanicked = errors.New("recovered from a panic")
 
 type objectState struct {
 	size       int64
@@ -109,16 +113,29 @@ func (t *task) finished() *time.Time {
 	return t.finishedAt
 }
 
-// hasAny reports whether the run pulls any of oids.
-func (t *task) hasAny(oids []string) bool {
+// within reports whether every object that the run pulls is in oids.
+func (t *task) within(oids map[string]struct{}) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	for _, oid := range oids {
-		if _, ok := t.objects[oid]; ok {
-			return true
+	for oid := range t.objects {
+		if _, ok := oids[oid]; !ok {
+			return false
 		}
 	}
-	return false
+	return true
+}
+
+// failedObjects returns the objects that the run failed.
+func (t *task) failedObjects() []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	var failed []string
+	for oid, o := range t.objects {
+		if o.state == FileFailed {
+			failed = append(failed, oid)
+		}
+	}
+	return failed
 }
 
 func (t *task) update(oid string, fn func(o *objectState)) {
@@ -232,8 +249,15 @@ func (s *Service) next(t *task) (oid string, done bool) {
 	return "", false
 }
 
+// work fetches one object. It runs on its own goroutine, where no request
+// handler recovers a panic, so it recovers one itself and fails the object
+// instead of ending the process.
 func (s *Service) work(t *task, oid string) {
 	defer func() {
+		if r := recover(); r != nil {
+			log.Errorf("model cache: object %s of %s/%s: %v: %v\n%s", oid, t.project, t.name, errPanicked, r, debug.Stack())
+			t.update(oid, func(o *objectState) { o.state, o.err = FileFailed, errDownloadFailed.Error() })
+		}
 		t.mu.Lock()
 		t.active--
 		t.mu.Unlock()
@@ -338,7 +362,9 @@ func (s *Service) fetchWithRetry(t *task, oid string) {
 
 // fetchOnce makes sure the object is downloading, re-queuing it through a
 // forced model sync when the mirror no longer tracks it, and waits until it
-// is stored. It holds a download slot only while the object downloads.
+// is stored. It holds a download slot only while the object downloads, and
+// the object shows as downloading only from then on: while it waits for a
+// slot or a re-sync, it stays queued.
 func (s *Service) fetchOnce(t *task, oid string, sl *slot) error {
 	if s.git.LFSObjectExists(s.ctx, oid) {
 		return nil
@@ -346,7 +372,6 @@ func (s *Service) fetchOnce(t *task, oid string, sl *slot) error {
 	if err := sl.acquire(s.ctx); err != nil {
 		return err
 	}
-	t.update(oid, func(o *objectState) { o.state = FileDownloading })
 	if s.git.FetchLFSObject(s.ctx, oid) == nil {
 		if s.git.LFSObjectExists(s.ctx, oid) {
 			return nil
@@ -366,6 +391,7 @@ func (s *Service) fetchOnce(t *task, oid string, sl *slot) error {
 			return errNotQueued
 		}
 	}
+	t.update(oid, func(o *objectState) { o.state = FileDownloading })
 	return s.waitStored(t, oid, sl)
 }
 
@@ -463,7 +489,7 @@ func (s *Service) refresh(ctx context.Context, project, name string) error {
 	case r := <-ch:
 		return r.Err
 	case <-ctx.Done():
-		return ctx.Err()
+		return context.Cause(ctx)
 	}
 }
 
@@ -480,13 +506,27 @@ func (s *Service) requeue(project, name string) error {
 	}
 }
 
-// untilDone runs fn and returns its error, or ctx's error once ctx ends. The
-// mirror runs git without a wait delay, so a git command can outlive its
-// context until upstream answers; the caller then stops waiting, and fn ends
-// in the background.
+// untilDone runs fn and returns its error, or the cause of ctx's end once ctx
+// ends. The mirror runs git without a wait delay, so a git command can outlive
+// its context until upstream answers; the caller then stops waiting, and fn
+// ends in the background.
+//
+// fn runs on its own goroutine, where no request handler recovers a panic, so
+// a panic becomes an error here instead of ending the process.
 func untilDone(ctx context.Context, fn func(context.Context) error) error {
+	if ctx.Err() != nil {
+		return context.Cause(ctx)
+	}
 	done := make(chan error, 1)
-	go func() { done <- fn(ctx) }()
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Errorf("model cache: %v: %v\n%s", errPanicked, r, debug.Stack())
+				done <- fmt.Errorf("%w: %v", errPanicked, r)
+			}
+		}()
+		done <- fn(ctx)
+	}()
 	select {
 	case err := <-done:
 		return err
@@ -495,7 +535,7 @@ func untilDone(ctx context.Context, fn func(context.Context) error) error {
 		case err := <-done:
 			return err
 		default:
-			return ctx.Err()
+			return context.Cause(ctx)
 		}
 	}
 }

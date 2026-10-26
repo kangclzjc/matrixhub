@@ -10,9 +10,9 @@
 package v1alpha1
 
 type ModelsCacheModelBody struct {
-	// Branch, tag or commit. Empty means the default branch. Other refs, such as refs/pr/1, are rejected: MatrixHub mirrors only branches and tags. So are revision expressions such as main~1, which upstream does not resolve.
+	// Branch, tag or commit. Empty means the default branch. A name resolves as git, and MatrixHub when hf download asks it, resolve it: a commit id first, then a tag before a branch of the same name. MatrixHub mirrors only branches and tags, so other refs, such as refs/pr/1, are rejected, and a name that upstream knows only as such a ref, as huggingface.co knows pr/1, is not found. Revision expressions such as main~1, which upstream does not resolve, and names that contain '@' are rejected too.
 	Revision string `json:"revision,omitempty"`
-	// Narrow the cached files; without patterns every file of the revision is cached. Patterns follow huggingface_hub fnmatch semantics: '*' and '?' also match '/', and a trailing '/' selects a whole directory. A list holds at most 16 patterns, and a pattern at most 256 characters and 16 wildcards ('*', '?' and classes).
+	// Narrow the cached files; without patterns every file of the revision is cached. Patterns follow huggingface_hub fnmatch semantics: '*' and '?' also match '/', a trailing '/' selects a whole directory, and '\\' counts as '/'. A list holds at most 16 patterns, and a pattern at most 256 characters and 16 wildcards ('*', '?' and classes).
 	AllowPatterns []string `json:"allowPatterns,omitempty"`
 	// Files that match an ignore pattern are not cached, even when they match an allow pattern. Same syntax and limits as allow_patterns.
 	IgnorePatterns []string `json:"ignorePatterns,omitempty"`

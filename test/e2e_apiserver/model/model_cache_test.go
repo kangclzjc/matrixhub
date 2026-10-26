@@ -118,20 +118,24 @@ var _ = Describe("Model cache", Label("model", "model-cache"), func() {
 
 		It("should not let a viewer preview or start a pull", Label("M00065"), func() {
 			viewerModelsApi := tools.CreateModelClientWithCookie(viewerCookie)
+			// A model that upstream does not have: should the permission check
+			// ever let the viewer through, no pull of gigabytes starts.
 			for _, dryRun := range []bool{true, false} {
-				_, resp, err := viewerModelsApi.ModelsCacheModel(ctx, projectName, "gpt2", v1alpha1model.ModelsCacheModelBody{DryRun: dryRun})
+				_, resp, err := viewerModelsApi.ModelsCacheModel(ctx, projectName, "no-such-model-e2e", v1alpha1model.ModelsCacheModelBody{DryRun: dryRun})
 				Expect(err).To(HaveOccurred())
 				Expect(resp.StatusCode).To(Equal(http.StatusForbidden))
 			}
 		})
 
 		It("should preview a pull from upstream without creating the model", Label("M00066"), func() {
-			st, _, err := modelsApi.ModelsCacheModel(ctx, projectName, "gpt2", v1alpha1model.ModelsCacheModelBody{
+			st, err := previewRetryingUnavailable(ctx, modelsApi, projectName, "gpt2", v1alpha1model.ModelsCacheModelBody{
 				DryRun:        true,
 				AllowPatterns: []string{"*.json"},
 			})
 			Expect(err).NotTo(HaveOccurred())
-			Expect(st.Revision).To(Equal("main"))
+			// The name of the default branch is best effort: it is left out
+			// when the registry does not tell it in time.
+			Expect(st.Revision).To(Or(Equal("main"), BeEmpty()))
 			Expect(st.Commit).To(HaveLen(40))
 			Expect(st.Files).NotTo(BeEmpty())
 			for _, f := range st.Files {
@@ -151,3 +155,18 @@ var _ = Describe("Model cache", Label("model", "model-cache"), func() {
 		})
 	})
 })
+
+// previewRetryingUnavailable runs a dry run, retrying for a minute while
+// upstream is unavailable: hf-mirror.com, and huggingface.co, which it
+// redirects to, are sometimes out of reach of a CI runner for a few seconds.
+func previewRetryingUnavailable(ctx context.Context, api *v1alpha1model.ModelsApiService, project, name string, body v1alpha1model.ModelsCacheModelBody) (v1alpha1model.V1alpha1ModelCacheStatus, error) {
+	deadline := time.Now().Add(time.Minute)
+	for {
+		st, resp, err := api.ModelsCacheModel(ctx, project, name, body)
+		if err == nil || resp == nil || resp.StatusCode != http.StatusServiceUnavailable || time.Now().After(deadline) {
+			return st, err
+		}
+		GinkgoWriter.Printf("upstream unavailable, retrying: %v\n", err)
+		time.Sleep(5 * time.Second)
+	}
+}

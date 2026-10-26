@@ -87,6 +87,8 @@ type fixture struct {
 	lister *upstream
 	disk   sync.Map
 	svc    modelcache.IModelCacheService
+	// hasCommits counts the reads of local repositories for a commit.
+	hasCommits atomic.Int32
 }
 
 func newFixture(t *testing.T, opts modelcache.Options) *fixture {
@@ -123,7 +125,10 @@ func newFixture(t *testing.T, opts modelcache.Options) *fixture {
 		}).AnyTimes()
 	// Local repositories have the commit that revisionFiles lists.
 	f.git.EXPECT().HasCommit(gomock.Any(), "models", "proj", gomock.Any(), gomock.Any()).
-		DoAndReturn(func(_ context.Context, _, _, _, commit string) bool { return commit == "c1" }).AnyTimes()
+		DoAndReturn(func(_ context.Context, _, _, _, commit string) bool {
+			f.hasCommits.Add(1)
+			return commit == "c1"
+		}).AnyTimes()
 
 	if opts.PollInterval == 0 {
 		opts.PollInterval = time.Millisecond
@@ -1312,4 +1317,356 @@ func TestCacheModel_UnstoredDownloadFreesItsSlot(t *testing.T) {
 		st, err := f.svc.GetModelCache(context.Background(), "proj", "other", "")
 		return err == nil && st.Task != nil && st.Task.State == modelcache.TaskSucceeded
 	}, 5*time.Second, 2*time.Millisecond)
+}
+
+// The sync runs on a goroutine of its own, where no request handler recovers
+// a panic of the mirror: a panic fails the pull instead of the server.
+func TestCacheModel_SyncPanicFailsThePull(t *testing.T) {
+	f := newFixture(t, modelcache.Options{})
+	f.models.EXPECT().GetModel(gomock.Any(), "proj", "model").Return(syncedModel("model"), nil)
+	f.models.EXPECT().CheckOrSyncFromRemote(gomock.Any(), "proj", "model").
+		DoAndReturn(func(context.Context, string, string) error {
+			panic("runtime error: invalid memory address or nil pointer dereference")
+		})
+
+	_, err := f.svc.CacheModel(context.Background(), pullModel)
+
+	require.ErrorIs(t, err, modelcache.ErrUpstreamSync)
+}
+
+func TestCacheModel_RefreshPanicFailsTheObject(t *testing.T) {
+	f := newFixture(t, modelcache.Options{MaxAttempts: 1})
+	f.existingModel()
+	f.models.EXPECT().CheckOrSyncFromRemote(gomock.Any(), "proj", "model").Return(nil)
+	f.models.EXPECT().RefreshFromRemote(gomock.Any(), "proj", "model").
+		DoAndReturn(func(context.Context, string, string) error { panic("boom") }).AnyTimes()
+	f.git.EXPECT().FetchLFSObject(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+
+	_, err := f.svc.CacheModel(context.Background(), pullModel)
+	require.NoError(t, err)
+
+	st := waitForTask(t, f, modelcache.TaskFailed)
+	for _, file := range st.Files {
+		if file.IsLFS {
+			require.Equal(t, "refreshing the model from upstream failed; see server logs for details", file.Error)
+		}
+	}
+}
+
+// A worker that panics fails its object, frees its download slot and lets
+// the run end.
+func TestCacheModel_DownloadPanicFailsTheObject(t *testing.T) {
+	f := newFixture(t, modelcache.Options{MaxAttempts: 1, GlobalConcurrency: 1})
+	f.existingModel()
+	f.models.EXPECT().CheckOrSyncFromRemote(gomock.Any(), "proj", "model").Return(nil)
+	f.git.EXPECT().FetchLFSObject(gomock.Any(), gomock.Any()).
+		DoAndReturn(func(_ context.Context, oid string) git.LFSDownload {
+			if oid == oidA {
+				panic("boom")
+			}
+			f.disk.Store(oid, true)
+			return download{done: 1, total: 1}
+		}).AnyTimes()
+
+	_, err := f.svc.CacheModel(context.Background(), pullModel)
+	require.NoError(t, err)
+
+	st := waitForTask(t, f, modelcache.TaskFailed)
+	require.Equal(t, modelcache.FileFailed, fileState(st, oidA).State)
+	require.Equal(t, "download failed; see server logs for details", fileState(st, oidA).Error)
+	require.Equal(t, modelcache.FileCached, fileState(st, oidB).State)
+}
+
+// A preview does not read the repository of a model that never synced: it
+// holds only its placeholder commit, so none of the revision's files are in it.
+func TestCacheModel_DryRunDoesNotReadANeverSyncedModel(t *testing.T) {
+	f := newFixture(t, modelcache.Options{})
+	f.models.EXPECT().GetModel(gomock.Any(), "proj", "model").Return(&model.Model{Name: "model", ProjectName: "proj"}, nil).AnyTimes()
+
+	st, err := f.svc.CacheModel(context.Background(), &modelcache.Request{Project: "proj", Name: "model", DryRun: true})
+
+	require.NoError(t, err)
+	require.Zero(t, f.hasCommits.Load())
+	require.Equal(t, modelcache.CacheStateMissing, st.State)
+}
+
+// A model whose first sync failed, for example because upstream is gated, is
+// checked upstream like a new one, so the pull reports why.
+func TestCacheModel_NeverSyncedModelIsCheckedUpstreamBeforeSync(t *testing.T) {
+	f := newFixture(t, modelcache.Options{})
+	f.models.EXPECT().GetModel(gomock.Any(), "proj", "model").Return(&model.Model{Name: "model", ProjectName: "proj"}, nil)
+	f.lister.err = fmt.Errorf("%w: %w", registrydiscovery.ErrRemoteAccessDenied, registrydiscovery.ErrRemoteGated)
+
+	// No CheckOrSyncFromRemote expectation: the strict mock fails the test
+	// if the sync ran.
+	_, err := f.svc.CacheModel(context.Background(), pullModel)
+
+	require.ErrorIs(t, err, modelcache.ErrUpstreamAccessDenied)
+	require.ErrorIs(t, err, registrydiscovery.ErrRemoteGated)
+}
+
+// Closing the service ends the pulls that wait for a sync, a forced re-sync
+// or the lock of their model, so they do not hold up the server's shutdown.
+func TestClose_EndsPullsThatWait(t *testing.T) {
+	t.Run("for a sync and for the model lock", func(t *testing.T) {
+		f := newFixture(t, modelcache.Options{})
+		f.models.EXPECT().GetModel(gomock.Any(), "proj", "model").Return(syncedModel("model"), nil).AnyTimes()
+		hang, syncing := make(chan struct{}), make(chan struct{})
+		t.Cleanup(func() { close(hang) })
+		// The mirror cannot always stop git at once: the sync ignores its
+		// context.
+		f.models.EXPECT().CheckOrSyncFromRemote(gomock.Any(), "proj", "model").
+			DoAndReturn(func(context.Context, string, string) error {
+				close(syncing)
+				<-hang
+				return nil
+			})
+		errs := make(chan error, 2)
+		go func() {
+			_, err := f.svc.CacheModel(context.Background(), pullModel)
+			errs <- err
+		}()
+		<-syncing
+		go func() {
+			_, err := f.svc.CacheModel(context.Background(), pullModel)
+			errs <- err
+		}()
+
+		closeWithin(t, f, 5*time.Second)
+		for range 2 {
+			require.ErrorIs(t, <-errs, modelcache.ErrClosed)
+		}
+	})
+
+	t.Run("for a forced re-sync", func(t *testing.T) {
+		f := newFixture(t, modelcache.Options{})
+		f.models.EXPECT().GetModel(gomock.Any(), "proj", "model").Return(syncedModel("model"), nil).AnyTimes()
+		f.models.EXPECT().CheckOrSyncFromRemote(gomock.Any(), "proj", "model").Return(nil)
+		f.git.EXPECT().ListRevisionFiles(gomock.Any(), "models", "proj", "model", "v2").Return(nil, revisionNotFound("v2")).AnyTimes()
+		f.lister.files = &git.RevisionFiles{Revision: "v2", Commit: "c2", Files: revisionFiles().Files}
+		hanging := f.hangingRefresh(t)
+		errs := make(chan error, 1)
+		go func() {
+			_, err := f.svc.CacheModel(context.Background(), &modelcache.Request{Project: "proj", Name: "model", Revision: "v2"})
+			errs <- err
+		}()
+		<-hanging
+
+		closeWithin(t, f, 5*time.Second)
+		require.ErrorIs(t, <-errs, modelcache.ErrClosed)
+	})
+}
+
+func closeWithin(t *testing.T, f *fixture, d time.Duration) {
+	t.Helper()
+	closed := make(chan struct{})
+	go func() {
+		f.svc.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(d):
+		t.Fatal("Close() did not return")
+	}
+}
+
+// branchFiles lists a branch int4 of commit c2 that shares tokenizer.json (B)
+// with main and has weights C of its own.
+func branchFiles() *git.RevisionFiles {
+	return &git.RevisionFiles{Revision: "int4", Commit: "c2", Files: []git.RevisionFile{
+		{Path: "config.json", Size: 10},
+		{Path: "model-int4.safetensors", Size: 40, IsLFS: true, OID: oidC},
+		{Path: "tokenizer.json", Size: 50, IsLFS: true, OID: oidB},
+	}}
+}
+
+func (f *fixture) twoBranches() {
+	f.models.EXPECT().GetModel(gomock.Any(), "proj", "model").Return(syncedModel("model"), nil).AnyTimes()
+	f.git.EXPECT().ListRevisionFiles(gomock.Any(), "models", "proj", "model", "").Return(revisionFiles(), nil).AnyTimes()
+	f.git.EXPECT().ListRevisionFiles(gomock.Any(), "models", "proj", "model", "int4").Return(branchFiles(), nil).AnyTimes()
+	var progress atomic.Int64
+	f.git.EXPECT().FetchLFSObject(gomock.Any(), gomock.Any()).
+		DoAndReturn(func(context.Context, string) git.LFSDownload {
+			return download{done: progress.Add(1), total: 1 << 40}
+		}).AnyTimes()
+}
+
+// A run of another branch that shares an object is not a run of main: main's
+// own weights are not pulled by it.
+func TestGetModelCache_IgnoresTheRunOfAnotherBranch(t *testing.T) {
+	f := newFixture(t, modelcache.Options{})
+	f.twoBranches()
+	f.models.EXPECT().CheckOrSyncFromRemote(gomock.Any(), "proj", "model").Return(nil)
+	int4, err := f.svc.CacheModel(context.Background(), &modelcache.Request{Project: "proj", Name: "model", Revision: "int4"})
+	require.NoError(t, err)
+	require.Equal(t, modelcache.TaskRunning, int4.Task.State)
+
+	// The shared object shows its download in the status of main too.
+	var st *modelcache.CacheStatus
+	require.Eventually(t, func() bool {
+		st, err = f.svc.GetModelCache(context.Background(), "proj", "model", "")
+		return err == nil && fileState(st, oidB).State == modelcache.FileDownloading
+	}, 5*time.Second, time.Millisecond)
+
+	require.Equal(t, "c1", st.Commit)
+	require.Nil(t, st.Task)
+	require.Equal(t, modelcache.FileMissing, fileState(st, oidA).State)
+}
+
+func TestGetModelCache_PrefersTheRunOfItsCommit(t *testing.T) {
+	f := newFixture(t, modelcache.Options{})
+	f.twoBranches()
+	f.models.EXPECT().CheckOrSyncFromRemote(gomock.Any(), "proj", "model").Return(nil).Times(3)
+	own, err := f.svc.CacheModel(context.Background(), pullModel)
+	require.NoError(t, err)
+	// A later run of int4 that pulls only the shared object.
+	shared := &modelcache.Request{Project: "proj", Name: "model", Revision: "int4", Selection: modelcache.Selection{AllowPatterns: []string{"tokenizer.json"}}}
+	other, err := f.svc.CacheModel(context.Background(), shared)
+	require.NoError(t, err)
+	require.NotEqual(t, own.Task.ID, other.Task.ID)
+	_, err = f.svc.CacheModel(context.Background(), &modelcache.Request{Project: "proj", Name: "model", Revision: "int4"})
+	require.NoError(t, err)
+
+	st, err := f.svc.GetModelCache(context.Background(), "proj", "model", "")
+
+	require.NoError(t, err)
+	require.Equal(t, own.Task.ID, st.Task.ID)
+}
+
+// After the branch moved to a commit with the same objects, the status of the
+// branch keeps showing the run, also once it failed.
+func TestGetModelCache_KeepsTheOutcomeOfARunThatFollowedTheBranch(t *testing.T) {
+	f := newFixture(t, modelcache.Options{MaxAttempts: 1})
+	f.models.EXPECT().GetModel(gomock.Any(), "proj", "model").Return(syncedModel("model"), nil).AnyTimes()
+	f.models.EXPECT().CheckOrSyncFromRemote(gomock.Any(), "proj", "model").Return(nil)
+	f.models.EXPECT().RefreshFromRemote(gomock.Any(), "proj", "model").Return(nil).AnyTimes()
+	var commit atomic.Value
+	commit.Store("c1")
+	f.git.EXPECT().ListRevisionFiles(gomock.Any(), "models", "proj", "model", gomock.Any()).
+		DoAndReturn(func(context.Context, string, string, string, string) (*git.RevisionFiles, error) {
+			files := revisionFiles()
+			files.Commit = commit.Load().(string)
+			return files, nil
+		}).AnyTimes()
+	f.disk.Store(oidB, true)
+	fail := make(chan struct{})
+	f.git.EXPECT().FetchLFSObject(gomock.Any(), gomock.Any()).
+		DoAndReturn(func(context.Context, string) git.LFSDownload {
+			select {
+			case <-fail:
+				return nil // the mirror forgot it: the run fails
+			default:
+				return download{done: 1, total: 100}
+			}
+		}).AnyTimes()
+	_, err := f.svc.CacheModel(context.Background(), pullModel)
+	require.NoError(t, err)
+
+	// An upstream README edit moved main, then the run failed.
+	commit.Store("c2")
+	close(fail)
+
+	st := waitForTask(t, f, modelcache.TaskFailed)
+	require.Equal(t, "c2", st.Commit)
+	require.Equal(t, modelcache.FileFailed, fileState(st, oidA).State)
+}
+
+// A failed run whose failed objects are all stored by now is not reported:
+// a preview and the status agree with a pull, which hides it too.
+func TestCacheModel_FailureThatNoLongerHoldsIsHiddenEverywhere(t *testing.T) {
+	f := newFixture(t, modelcache.Options{MaxAttempts: 1})
+	f.existingModel()
+	f.models.EXPECT().CheckOrSyncFromRemote(gomock.Any(), "proj", "model").Return(nil).Times(2)
+	f.models.EXPECT().RefreshFromRemote(gomock.Any(), "proj", "model").Return(nil).AnyTimes()
+	f.git.EXPECT().FetchLFSObject(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+	narrow := &modelcache.Request{Project: "proj", Name: "model", Selection: modelcache.Selection{AllowPatterns: []string{"model.safetensors"}}}
+	_, err := f.svc.CacheModel(context.Background(), narrow)
+	require.NoError(t, err)
+	waitForTask(t, f, modelcache.TaskFailed)
+
+	// A client downloaded the failed object meanwhile; tokenizer.json is
+	// still missing.
+	f.disk.Store(oidA, true)
+
+	pull, err := f.svc.CacheModel(context.Background(), narrow)
+	require.NoError(t, err)
+	require.Nil(t, pull.Task)
+	preview := *narrow
+	preview.DryRun = true
+	dry, err := f.svc.CacheModel(context.Background(), &preview)
+	require.NoError(t, err)
+	require.Nil(t, dry.Task)
+	st, err := f.svc.GetModelCache(context.Background(), "proj", "model", "")
+	require.NoError(t, err)
+	require.Equal(t, modelcache.CacheStatePartial, st.State)
+	require.Nil(t, st.Task)
+}
+
+// An object that gave its download slot back for a re-sync, and waits for a
+// slot again, has not started: it shows as queued, not downloading.
+func TestCacheModel_ObjectWaitingForASlotIsQueued(t *testing.T) {
+	f := newFixture(t, modelcache.Options{GlobalConcurrency: 1})
+	f.existingModel()
+	f.disk.Store(oidA, true)
+	f.models.EXPECT().CheckOrSyncFromRemote(gomock.Any(), "proj", gomock.Any()).Return(nil).Times(2)
+	inRefresh, release := make(chan struct{}), make(chan struct{})
+	f.models.EXPECT().RefreshFromRemote(gomock.Any(), "proj", "model").
+		DoAndReturn(func(context.Context, string, string) error {
+			close(inRefresh)
+			<-release
+			return nil
+		})
+	other := &git.RevisionFiles{Revision: "main", Commit: "c3", Files: []git.RevisionFile{
+		{Path: "model.safetensors", Size: 100, IsLFS: true, OID: oidC},
+	}}
+	f.models.EXPECT().GetModel(gomock.Any(), "proj", "other").Return(syncedModel("other"), nil).AnyTimes()
+	f.git.EXPECT().ListRevisionFiles(gomock.Any(), "models", "proj", "other", gomock.Any()).Return(other, nil).AnyTimes()
+	var progress atomic.Int64
+	f.git.EXPECT().FetchLFSObject(gomock.Any(), gomock.Any()).
+		DoAndReturn(func(_ context.Context, oid string) git.LFSDownload {
+			if oid == oidB {
+				return nil // forgotten: B re-syncs
+			}
+			return download{done: progress.Add(1), total: 1 << 40} // C downloads slowly
+		}).AnyTimes()
+
+	_, err := f.svc.CacheModel(context.Background(), pullModel)
+	require.NoError(t, err)
+	<-inRefresh
+	st, err := f.svc.GetModelCache(context.Background(), "proj", "model", "")
+	require.NoError(t, err)
+	require.Equal(t, modelcache.FileQueued, fileState(st, oidB).State, "B waits for a re-sync")
+
+	_, err = f.svc.CacheModel(context.Background(), &modelcache.Request{Project: "proj", Name: "other"})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		st, err := f.svc.GetModelCache(context.Background(), "proj", "other", "")
+		return err == nil && st.Files[0].State == modelcache.FileDownloading
+	}, 5*time.Second, time.Millisecond)
+	close(release) // B now waits for the slot that C holds
+	time.Sleep(50 * time.Millisecond)
+
+	st, err = f.svc.GetModelCache(context.Background(), "proj", "model", "")
+	require.NoError(t, err)
+	require.Equal(t, modelcache.FileQueued, fileState(st, oidB).State, "B waits for a slot")
+	require.Zero(t, st.Totals.DownloadingFiles)
+}
+
+func TestCacheModel_RejectsRevisionsThatMatrixHubCannotResolve(t *testing.T) {
+	f := newFixture(t, modelcache.Options{})
+
+	// No GetModel expectation: the request fails before any lookup.
+	_, err := f.svc.CacheModel(context.Background(), &modelcache.Request{Project: "proj", Name: "model", Revision: "release@2024"})
+
+	require.ErrorIs(t, err, modelcache.ErrUnsupportedRevision)
+}
+
+func TestGetModelCache_RejectsRevisionExpressions(t *testing.T) {
+	f := newFixture(t, modelcache.Options{})
+
+	for _, revision := range []string{"main~1", "refs/pr/1", "a@b"} {
+		_, err := f.svc.GetModelCache(context.Background(), "proj", "model", revision)
+		require.ErrorIs(t, err, modelcache.ErrUnsupportedRevision, revision)
+	}
 }

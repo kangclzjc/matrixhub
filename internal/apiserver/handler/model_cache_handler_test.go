@@ -102,9 +102,32 @@ func TestCacheModelPassesTheRequest(t *testing.T) {
 	require.Equal(t, modelv1alpha1.CacheState_CACHE_STATE_MISSING, st.GetState())
 }
 
-func TestGetModelCacheNeedsGetPermission(t *testing.T) {
+func TestGetModelCacheNeedsGetOrPullPermission(t *testing.T) {
 	f := newCacheHandler(t)
 	f.expectPermission(role.ModelGet, false)
+	f.expectPermission(role.ModelPull, false)
+
+	_, err := f.handler.GetModelCache(t.Context(), &modelv1alpha1.GetModelCacheRequest{Project: "proj", Name: "model"})
+
+	require.Equal(t, codes.PermissionDenied, status.Code(err))
+}
+
+// Robot accounts cannot hold model.get; one that may pull the files may see
+// how much of them is cached.
+func TestGetModelCacheAcceptsPullPermission(t *testing.T) {
+	f := newCacheHandler(t)
+	f.expectPermission(role.ModelGet, false)
+	f.expectPermission(role.ModelPull, true)
+	f.cache.EXPECT().GetModelCache(gomock.Any(), "proj", "model", "").Return(missingStatus, nil)
+
+	_, err := f.handler.GetModelCache(t.Context(), &modelv1alpha1.GetModelCacheRequest{Project: "proj", Name: "model"})
+
+	require.NoError(t, err)
+}
+
+func TestGetModelCacheDeniesWhenThePermissionCheckFails(t *testing.T) {
+	f := newCacheHandler(t)
+	f.authz.EXPECT().VerifyProjectPermissionByName(gomock.Any(), "proj", role.ModelGet).Return(false, errors.New("database unavailable"))
 
 	_, err := f.handler.GetModelCache(t.Context(), &modelv1alpha1.GetModelCacheRequest{Project: "proj", Name: "model"})
 
@@ -320,4 +343,37 @@ func TestModelCacheStatusToProto(t *testing.T) {
 
 	// Without a run the task is unset.
 	require.Nil(t, modelCacheStatusToProto(&modelcache.CacheStatus{State: modelcache.CacheStateCached}).GetTask())
+}
+
+func TestModelCacheEnumsToProto(t *testing.T) {
+	taskStates := map[modelcache.TaskState]modelv1alpha1.CacheTaskState{
+		modelcache.TaskRunning:   modelv1alpha1.CacheTaskState_CACHE_TASK_STATE_RUNNING,
+		modelcache.TaskSucceeded: modelv1alpha1.CacheTaskState_CACHE_TASK_STATE_SUCCEEDED,
+		modelcache.TaskFailed:    modelv1alpha1.CacheTaskState_CACHE_TASK_STATE_FAILED,
+		0:                        modelv1alpha1.CacheTaskState_CACHE_TASK_STATE_UNSPECIFIED,
+	}
+	for in, want := range taskStates {
+		require.Equal(t, want, cacheTaskStateToProto(in), "task state %d", in)
+	}
+
+	states := map[modelcache.CacheState]modelv1alpha1.CacheState{
+		modelcache.CacheStateMissing: modelv1alpha1.CacheState_CACHE_STATE_MISSING,
+		modelcache.CacheStatePartial: modelv1alpha1.CacheState_CACHE_STATE_PARTIAL,
+		modelcache.CacheStateCached:  modelv1alpha1.CacheState_CACHE_STATE_CACHED,
+		0:                            modelv1alpha1.CacheState_CACHE_STATE_UNSPECIFIED,
+	}
+	for in, want := range states {
+		require.Equal(t, want, cacheStateToProto(in), "cache state %d", in)
+	}
+
+	fileStates := map[modelcache.FileState]modelv1alpha1.CacheFileState{
+		modelcache.FileMissing:     modelv1alpha1.CacheFileState_CACHE_FILE_STATE_MISSING,
+		modelcache.FileQueued:      modelv1alpha1.CacheFileState_CACHE_FILE_STATE_QUEUED,
+		modelcache.FileDownloading: modelv1alpha1.CacheFileState_CACHE_FILE_STATE_DOWNLOADING,
+		modelcache.FileCached:      modelv1alpha1.CacheFileState_CACHE_FILE_STATE_CACHED,
+		modelcache.FileFailed:      modelv1alpha1.CacheFileState_CACHE_FILE_STATE_FAILED,
+	}
+	for in, want := range fileStates {
+		require.Equal(t, want, cacheFileStateToProto(in), "file state %d", in)
+	}
 }

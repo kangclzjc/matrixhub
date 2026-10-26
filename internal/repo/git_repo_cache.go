@@ -27,7 +27,12 @@ import (
 )
 
 // ListRevisionFiles resolves revision in the local repository and lists every
-// file of that commit recursively, with LFS pointer details.
+// file of that commit recursively, with LFS pointer details. The revision
+// resolves as the Hugging Face API of hfd resolves it, with git's rules: a
+// commit id first, then a tag before a branch of the same name. A pull then
+// caches the commit that hf download asks MatrixHub for. The model pages use
+// resolveRef, which prefers the branch; the two differ only for a name that
+// is both.
 func (g *gitRepo) ListRevisionFiles(ctx context.Context, repoType, project, name, revision string) (*git.RevisionFiles, error) {
 	gitPath := g.gitPath(repoType, project, name)
 	if !repository.IsRepository(gitPath) {
@@ -42,7 +47,7 @@ func (g *gitRepo) ListRevisionFiles(ctx context.Context, repoType, project, name
 	if rev == "" {
 		rev = repo.DefaultBranch()
 	}
-	commit, err := repo.ResolveRevision(resolveRef(repo, rev))
+	commit, err := repo.ResolveRevision(rev)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %q: %w", git.ErrRevisionNotFound, rev, err)
 	}

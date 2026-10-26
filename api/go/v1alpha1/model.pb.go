@@ -131,7 +131,8 @@ const (
 	CacheFileState_CACHE_FILE_STATE_UNSPECIFIED CacheFileState = 0
 	CacheFileState_CACHE_FILE_STATE_CACHED      CacheFileState = 1
 	CacheFileState_CACHE_FILE_STATE_DOWNLOADING CacheFileState = 2
-	// Part of a running cache task, not started yet.
+	// Part of a running cache task, not started yet, or waiting for its next
+	// attempt; error then tells why the last attempt failed.
 	CacheFileState_CACHE_FILE_STATE_QUEUED  CacheFileState = 3
 	CacheFileState_CACHE_FILE_STATE_MISSING CacheFileState = 4
 	CacheFileState_CACHE_FILE_STATE_FAILED  CacheFileState = 5
@@ -1990,15 +1991,19 @@ type CacheModelRequest struct {
 	Project string                 `protobuf:"bytes,1,opt,name=project,proto3" json:"project,omitempty"`
 	// Name of the model. As on Hugging Face, it may start with '_'.
 	Name string `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
-	// Branch, tag or commit. Empty means the default branch. Other refs, such as
-	// refs/pr/1, are rejected: MatrixHub mirrors only branches and tags. So are
-	// revision expressions such as main~1, which upstream does not resolve.
+	// Branch, tag or commit. Empty means the default branch. A name resolves as
+	// git, and MatrixHub when hf download asks it, resolve it: a commit id
+	// first, then a tag before a branch of the same name. MatrixHub mirrors only
+	// branches and tags, so other refs, such as refs/pr/1, are rejected, and a
+	// name that upstream knows only as such a ref, as huggingface.co knows pr/1,
+	// is not found. Revision expressions such as main~1, which upstream does not
+	// resolve, and names that contain '@' are rejected too.
 	Revision string `protobuf:"bytes,3,opt,name=revision,proto3" json:"revision,omitempty"`
 	// Narrow the cached files; without patterns every file of the revision is
 	// cached. Patterns follow huggingface_hub fnmatch semantics: '*' and '?'
-	// also match '/', and a trailing '/' selects a whole directory. A list
-	// holds at most 16 patterns, and a pattern at most 256 characters and 16
-	// wildcards ('*', '?' and classes).
+	// also match '/', a trailing '/' selects a whole directory, and '\' counts
+	// as '/'. A list holds at most 16 patterns, and a pattern at most 256
+	// characters and 16 wildcards ('*', '?' and classes).
 	AllowPatterns []string `protobuf:"bytes,4,rep,name=allow_patterns,json=allowPatterns,proto3" json:"allow_patterns,omitempty"`
 	// Files that match an ignore pattern are not cached, even when they match
 	// an allow pattern. Same syntax and limits as allow_patterns.
@@ -2088,7 +2093,8 @@ type GetModelCacheRequest struct {
 	Project string                 `protobuf:"bytes,1,opt,name=project,proto3" json:"project,omitempty"`
 	// Name of the model. As on Hugging Face, it may start with '_'.
 	Name string `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
-	// Branch, tag or commit. Empty means the default branch.
+	// Branch, tag or commit. Empty means the default branch. It resolves, and
+	// is rejected, as the revision of CacheModelRequest.
 	Revision      string `protobuf:"bytes,3,opt,name=revision,proto3" json:"revision,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -2434,7 +2440,9 @@ type ModelCacheStatus struct {
 	RequestedRevision string                 `protobuf:"bytes,3,opt,name=requested_revision,json=requestedRevision,proto3" json:"requested_revision,omitempty"`
 	// The branch, tag or commit that was listed: requested_revision, or the name
 	// of the default branch when none was requested. A dry run leaves it empty
-	// when the registry does not name its default branch.
+	// when the registry does not name its default branch. It and commit are
+	// empty for a proxy model that has not synced yet: none of its files are
+	// known.
 	Revision string `protobuf:"bytes,4,opt,name=revision,proto3" json:"revision,omitempty"`
 	Commit   string `protobuf:"bytes,5,opt,name=commit,proto3" json:"commit,omitempty"`
 	// How much of the selected files is cached; see CacheState.
@@ -2442,9 +2450,11 @@ type ModelCacheStatus struct {
 	Totals *ModelCacheTotals `protobuf:"bytes,7,opt,name=totals,proto3" json:"totals,omitempty"`
 	Files  []*ModelCacheFile `protobuf:"bytes,8,rep,name=files,proto3" json:"files,omitempty"`
 	// The latest pull that the server knows of: of the requested selection for
-	// CacheModel, of the commit for GetModelCache. Unset when there is none, for
-	// example when no pull was started, the last one finished more than an hour
-	// ago, or the server restarted since.
+	// CacheModel; for GetModelCache, of files of the revision only, a running
+	// one first. Unset when there is none, for example when no pull was
+	// started, the last one finished more than an hour ago, or the server
+	// restarted since. A failed pull whose failed files were stored since is
+	// not reported.
 	Task          *ModelCacheTask `protobuf:"bytes,9,opt,name=task,proto3" json:"task,omitempty"`
 	Warnings      []string        `protobuf:"bytes,10,rep,name=warnings,proto3" json:"warnings,omitempty"`
 	unknownFields protoimpl.UnknownFields

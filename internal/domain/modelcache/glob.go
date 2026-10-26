@@ -24,12 +24,14 @@ import (
 // pattern.
 const maxPatternWildcards = 16
 
-// maxMatchSteps bounds the comparisons that matching makes for one plan, well
-// under a second of work. Finding a segment costs up to the path length times
-// the segment length, and a character class compares a rune with each of its
-// ranges, so long patterns against many long paths could otherwise keep the
-// server busy for minutes.
-const maxMatchSteps = 500_000_000
+// maxMatchSteps bounds the comparisons that matching makes for one plan:
+// about half a second of work for the costliest comparisons, a rune against a
+// range of a class, and about a third for most. Finding a segment costs up to
+// the path length times the segment length, and a character class compares a
+// rune with each of its ranges, so long patterns against many long paths
+// could otherwise keep the server busy for minutes. Ordinary selections stay
+// far below it: ten patterns that scan whole paths fit for 100,000 files.
+const maxMatchSteps = 100_000_000
 
 // matchBudget counts the comparisons that matching makes.
 type matchBudget struct {
@@ -39,8 +41,9 @@ type matchBudget struct {
 func (b *matchBudget) exceeded() bool { return b.steps > b.max }
 
 // glob matches a path against a pattern with huggingface_hub semantics:
-// fnmatch rules where '*' and '?' also match '/', and a trailing '/' selects a
-// directory. It does not use regular expressions: the pattern is split at its
+// fnmatch rules where '*' and '?' also match '/', a trailing '/' selects a
+// directory, and '\' counts as '/' in patterns and paths, as huggingface_hub
+// normalizes it. It does not use regular expressions: the pattern is split at its
 // '*'s into segments of single-rune matchers, the first and last segments are
 // anchored to the ends of the path, and the segments between are found from
 // left to right, each at its earliest position.
@@ -93,7 +96,7 @@ func compileGlob(pattern string) (*glob, error) {
 	if !utf8.ValidString(pattern) {
 		return nil, fmt.Errorf("%w: pattern %q is not valid UTF-8", ErrInvalidSelection, pattern)
 	}
-	body := pattern
+	body := normalizeSeparators(pattern)
 	wildcards := 0
 	if strings.HasSuffix(body, "/") {
 		// The '*' that selects the directory's files is not the user's.
@@ -154,9 +157,9 @@ func classEnd(runes []rune, start int) int {
 }
 
 // parseClass parses the body of a class: a leading '!' negates it and "a-z" is
-// a range. As in fnmatch, '^' and '\' are literals, and a reversed range such
-// as "z-a" is dropped: a class left empty matches nothing, or, negated, any
-// rune.
+// a range. As in fnmatch, '^' is a literal, and a reversed range such as "z-a"
+// is dropped: a class left empty matches nothing, or, negated, any rune. A '\'
+// was turned into '/' already.
 func parseClass(body []rune) runeMatcher {
 	m := runeMatcher{kind: matchClass}
 	if len(body) > 0 && body[0] == '!' {

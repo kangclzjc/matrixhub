@@ -22,11 +22,13 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	hfdlfs "github.com/matrixhub-ai/hfd/pkg/lfs"
+	"github.com/matrixhub-ai/hfd/pkg/mirror"
 	"github.com/matrixhub-ai/hfd/pkg/repository"
 	hfdstorage "github.com/matrixhub-ai/hfd/pkg/storage"
 
@@ -115,6 +117,68 @@ func TestListRevisionFiles(t *testing.T) {
 	}
 }
 
+// ListRevisionFiles resolves a revision as the Hugging Face API of hfd does,
+// so that a pull caches the commit that hf download later asks for.
+func TestListRevisionFilesResolvesAsHfd(t *testing.T) {
+	ctx := context.Background()
+	store := hfdstorage.NewStorage(hfdstorage.WithRootDir(t.TempDir()))
+	repo := NewGitDB(store, nil)
+	const project, name = "proj", "model"
+	if err := repo.CreateRepository(ctx, "models", project, name); err != nil {
+		t.Fatalf("CreateRepository() error = %v", err)
+	}
+	commit := &git.Commit{Message: "commit", AuthorName: "test", AuthorEmail: "test@example.com"}
+	first, err := repo.CreateCommit(ctx, "models", project, name, "main", commit, []git.CommitOperation{
+		{Type: git.CommitOperationAdd, Path: "README.md", Content: []byte("v1")},
+	})
+	if err != nil {
+		t.Fatalf("CreateCommit() error = %v", err)
+	}
+	second, err := repo.CreateCommit(ctx, "models", project, name, "main", commit, []git.CommitOperation{
+		{Type: git.CommitOperationAdd, Path: "README.md", Content: []byte("v2")},
+	})
+	if err != nil {
+		t.Fatalf("CreateCommit() error = %v", err)
+	}
+
+	gitPath := repo.(*gitRepo).gitPath("models", project, name)
+	r, err := repository.Open(gitPath)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	// A branch and a tag of the same name, at different commits.
+	if err := r.CreateBranch("v1", first); err != nil {
+		t.Fatalf("CreateBranch() error = %v", err)
+	}
+	if err := r.CreateTag("v1", second); err != nil {
+		t.Fatalf("CreateTag() error = %v", err)
+	}
+	if err := r.CreateBranch("pr/121", first); err != nil {
+		t.Fatalf("CreateBranch() error = %v", err)
+	}
+	cmd := exec.Command("git", "-C", gitPath, "tag", "-a", "annotated", "-m", "annotated", first)
+	cmd.Env = append(os.Environ(), "GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@example.com")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git tag: %v: %s", err, out)
+	}
+
+	for _, tt := range []struct{ revision, want string }{
+		{"v1", second},           // the tag, as git and hf download pick it
+		{"refs/heads/v1", first}, // the branch, when named in full
+		{"pr/121", first},
+		{"annotated", first},
+		{second[:7], second},
+	} {
+		got, err := repo.ListRevisionFiles(ctx, "models", project, name, tt.revision)
+		if err != nil {
+			t.Fatalf("ListRevisionFiles(%q) error = %v", tt.revision, err)
+		}
+		if got.Commit != tt.want || got.Revision != tt.revision {
+			t.Errorf("ListRevisionFiles(%q) = %q@%q, want commit %q", tt.revision, got.Revision, got.Commit, tt.want)
+		}
+	}
+}
+
 func TestHasCommit(t *testing.T) {
 	ctx := context.Background()
 	repo := NewGitDB(hfdstorage.NewStorage(hfdstorage.WithRootDir(t.TempDir())), nil)
@@ -180,5 +244,24 @@ func TestFetchLFSObjectWithoutMirror(t *testing.T) {
 
 	if d := repo.FetchLFSObject(context.Background(), strings.Repeat("a", 64)); d != nil {
 		t.Fatalf("FetchLFSObject() = %v, want nil without a mirror", d)
+	}
+}
+
+func TestFetchLFSObjectNotQueued(t *testing.T) {
+	root := t.TempDir()
+	store := hfdstorage.NewStorage(hfdstorage.WithRootDir(filepath.Join(root, "data")))
+	m := mirror.NewMirror(
+		mirror.WithLFSStorage(hfdlfs.NewLocal(store.LFSDir())),
+		mirror.WithCacheDir(filepath.Join(root, "cache")),
+	)
+	repo := NewGitDB(store, m)
+
+	// The mirror returns a nil *Blob for an object it does not track; the
+	// interface must be nil too, or callers would take it for a download.
+	if d := repo.FetchLFSObject(context.Background(), strings.Repeat("a", 64)); d != nil {
+		t.Fatalf("FetchLFSObject() = %#v, want a nil interface for an object that is not queued", d)
+	}
+	if d := repo.FetchLFSObject(context.Background(), "../not-an-oid"); d != nil {
+		t.Fatalf("FetchLFSObject() = %#v, want nil for an invalid object id", d)
 	}
 }

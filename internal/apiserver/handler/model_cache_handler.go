@@ -58,7 +58,13 @@ func (mh *ModelHandler) GetModelCache(ctx context.Context, request *modelv1alpha
 	if err := request.ValidateAll(); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-	if allowed, err := mh.authzService.VerifyProjectPermissionByName(ctx, request.Project, role.ModelGet); err != nil || !allowed {
+	// model.pull is enough too: whoever may download the files may see how
+	// much of them is cached, and robot accounts cannot hold model.get.
+	allowed, err := mh.authzService.VerifyProjectPermissionByName(ctx, request.Project, role.ModelGet)
+	if err == nil && !allowed {
+		allowed, err = mh.authzService.VerifyProjectPermissionByName(ctx, request.Project, role.ModelPull)
+	}
+	if err != nil || !allowed {
 		return nil, status.Error(codes.PermissionDenied, "permission denied")
 	}
 	st, err := mh.cache.GetModelCache(ctx, request.Project, request.Name, request.Revision)

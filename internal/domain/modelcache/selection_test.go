@@ -15,6 +15,7 @@
 package modelcache
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -61,7 +62,13 @@ func TestGlob(t *testing.T) {
 		{"[a-]x", "-x", true},
 		{"[^a]", "^", true},
 		{"[^a]", "b", false},
+		// As in huggingface_hub, '\' counts as '/' in patterns and paths.
 		{`a\b`, `a\b`, true},
+		{`a\b`, "a/b", true},
+		{"a/b", `a\b`, true},
+		{`original\`, "original/consolidated.00.pth", true},
+		{`unet\*.safetensors`, "unet/diffusion_pytorch_model.safetensors", true},
+		{`[\]`, "/", true},
 		{"[!]", "[!]", true},
 		{"模型/*.bin", "模型/权重.bin", true},
 		{"???", "ab", false},
@@ -77,7 +84,7 @@ func TestGlob(t *testing.T) {
 		t.Run(tt.pattern+"~"+tt.path, func(t *testing.T) {
 			g, err := compileGlob(tt.pattern)
 			require.NoError(t, err)
-			require.Equal(t, tt.want, g.match([]rune(tt.path), &matchBudget{max: maxMatchSteps}))
+			require.Equal(t, tt.want, g.match([]rune(normalizeSeparators(tt.path)), &matchBudget{max: maxMatchSteps}))
 		})
 	}
 }
@@ -140,7 +147,7 @@ func TestPlanFailsWhenClassesAreTooExpensive(t *testing.T) {
 	}
 
 	start := time.Now()
-	_, err = sel.plan(files)
+	_, err = sel.plan(context.Background(), files)
 	require.ErrorIs(t, err, ErrInvalidSelection)
 	require.Less(t, time.Since(start), 2*time.Second)
 }
@@ -161,7 +168,7 @@ func TestPlanStaysCheapWithPathologicalPatterns(t *testing.T) {
 	}
 
 	start := time.Now()
-	_, err = sel.plan(files)
+	_, err = sel.plan(context.Background(), files)
 	require.NoError(t, err)
 	require.Less(t, time.Since(start), 2*time.Second)
 }
@@ -182,7 +189,7 @@ func TestPlanFailsWhenMatchingIsTooExpensive(t *testing.T) {
 	}
 
 	start := time.Now()
-	_, err = sel.plan(files)
+	_, err = sel.plan(context.Background(), files)
 	require.ErrorIs(t, err, ErrInvalidSelection)
 	require.Less(t, time.Since(start), 2*time.Second)
 
@@ -190,7 +197,7 @@ func TestPlanFailsWhenMatchingIsTooExpensive(t *testing.T) {
 	for i := range files {
 		files[i].Path = fmt.Sprintf("%05d/", i) + strings.Repeat("model/", 30) + "model.safetensors"
 	}
-	_, err = sel.plan(files)
+	_, err = sel.plan(context.Background(), files)
 	require.NoError(t, err)
 }
 
@@ -210,7 +217,7 @@ func TestPlanSelectsEveryFileByDefault(t *testing.T) {
 	sel, err := compileSelection(Selection{})
 	require.NoError(t, err)
 
-	p, err := sel.plan([]git.RevisionFile{
+	p, err := sel.plan(context.Background(), []git.RevisionFile{
 		{Path: "config.json", Size: 10},
 		lfs("model.safetensors", "a", 100),
 		lfs("original/consolidated.00.pth", "b", 100),
@@ -232,7 +239,7 @@ func TestPlanAppliesPatterns(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	p, err := sel.plan([]git.RevisionFile{
+	p, err := sel.plan(context.Background(), []git.RevisionFile{
 		{Path: "README.md"},
 		{Path: "config.json"},
 		lfs("model-00001-of-00002.safetensors", "a", 1),
@@ -248,7 +255,7 @@ func TestPlanWarnsWhenNoWeightIsSelected(t *testing.T) {
 	sel, err := compileSelection(Selection{AllowPatterns: []string{"*.md"}})
 	require.NoError(t, err)
 
-	p, err := sel.plan([]git.RevisionFile{{Path: "README.md"}, lfs("model-q4_k_m.gguf", "a", 1)})
+	p, err := sel.plan(context.Background(), []git.RevisionFile{{Path: "README.md"}, lfs("model-q4_k_m.gguf", "a", 1)})
 	require.NoError(t, err)
 
 	require.Equal(t, []string{"README.md"}, paths(p.files))
@@ -259,7 +266,7 @@ func TestPlanWarnsWhenNothingIsSelected(t *testing.T) {
 	sel, err := compileSelection(Selection{AllowPatterns: []string{"*.nothing"}})
 	require.NoError(t, err)
 
-	p, err := sel.plan([]git.RevisionFile{{Path: "README.md"}})
+	p, err := sel.plan(context.Background(), []git.RevisionFile{{Path: "README.md"}})
 	require.NoError(t, err)
 
 	require.Empty(t, p.files)
@@ -270,7 +277,7 @@ func TestPlanDeduplicatesObjects(t *testing.T) {
 	sel, err := compileSelection(Selection{})
 	require.NoError(t, err)
 
-	p, err := sel.plan([]git.RevisionFile{lfs("a/model.safetensors", "x", 1), lfs("b/model.safetensors", "x", 1)})
+	p, err := sel.plan(context.Background(), []git.RevisionFile{lfs("a/model.safetensors", "x", 1), lfs("b/model.safetensors", "x", 1)})
 	require.NoError(t, err)
 
 	require.Len(t, p.files, 2)
@@ -281,4 +288,53 @@ func TestTaskKey(t *testing.T) {
 	require.Equal(t, taskKey("p", "m", []string{"a", "b"}), taskKey("p", "m", []string{"b", "a"}))
 	require.NotEqual(t, taskKey("p", "m", []string{"a"}), taskKey("p", "m", []string{"a", "b"}))
 	require.NotEqual(t, taskKey("p", "m", []string{"a"}), taskKey("p", "other", []string{"a"}))
+}
+
+func TestTaskKeyKeepsTheWholeDigest(t *testing.T) {
+	key := taskKey("p", "m", []string{"a"})
+
+	require.Len(t, strings.TrimPrefix(key, "p/m#"), 64)
+}
+
+func TestPlanWeightWarning(t *testing.T) {
+	tests := []struct {
+		name  string
+		allow []string
+		files []git.RevisionFile
+		warn  bool
+	}{
+		{
+			name:  "Rust weights are weights",
+			allow: []string{"*.json", "rust_model.ot"},
+			files: []git.RevisionFile{{Path: "config.json"}, lfs("rust_model.ot", "a", 1), lfs("model.safetensors", "b", 1)},
+		},
+		{
+			name:  "training arguments are no weights",
+			allow: []string{"*.json", "*.bin"},
+			files: []git.RevisionFile{{Path: "config.json"}, {Path: "training_args.bin"}, lfs("model.safetensors", "b", 1)},
+			warn:  true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sel, err := compileSelection(Selection{AllowPatterns: tt.allow})
+			require.NoError(t, err)
+
+			p, err := sel.plan(context.Background(), tt.files)
+			require.NoError(t, err)
+
+			require.Equal(t, tt.warn, len(p.warnings) > 0, "warnings: %q", p.warnings)
+		})
+	}
+}
+
+func TestPlanStopsWhenTheContextEnds(t *testing.T) {
+	sel, err := compileSelection(Selection{AllowPatterns: []string{"*.json"}})
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err = sel.plan(ctx, []git.RevisionFile{{Path: "config.json"}})
+
+	require.ErrorIs(t, err, context.Canceled)
 }

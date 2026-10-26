@@ -675,16 +675,19 @@ func (server *APIServer) Shutdown() {
 
 	server.cmux.Close()
 
+	// Stop cache tasks before the database closes under them, and before
+	// the servers drain their requests: GracefulStop waits for every RPC
+	// with no deadline, and a pull may wait minutes for a sync until the
+	// cache service closes.
+	if server.services != nil && server.services.ModelCache != nil {
+		server.services.ModelCache.Close()
+	}
+
 	if err := server.httpServer.Shutdown(ctx); err != nil {
 		log.Error("shutdown error", "error", err)
 	}
 
 	server.grpcServer.GracefulStop()
-
-	// Stop cache tasks before the database closes under them.
-	if server.services != nil && server.services.ModelCache != nil {
-		server.services.ModelCache.Close()
-	}
 
 	if err := server.repos.Close(); err != nil {
 		log.Error("close db connection error", "error", err)

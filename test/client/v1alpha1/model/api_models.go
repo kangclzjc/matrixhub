@@ -540,12 +540,12 @@ func (a *ModelsApiService) ModelsGetModelBlob(ctx context.Context, project strin
 }
 
 /*
-ModelsApiService GetModelCache reports the local cache status of every file of a model revision, and the latest pull of that commit. It is read-only: it never contacts upstream and never starts downloads.
+ModelsApiService GetModelCache reports the local cache status of every file of a model revision, and the latest pull of its files. It is read-only: it never contacts upstream and never starts downloads.
  * @param ctx context.Context - for authentication, logging, cancellation, deadlines, tracing, etc. Passed from http.Request or context.Background().
  * @param project
  * @param name Name of the model. As on Hugging Face, it may start with &#39;_&#39;.
  * @param optional nil or *ModelsApiModelsGetModelCacheOpts - Optional Parameters:
-     * @param "Revision" (optional.String) -  Branch, tag or commit. Empty means the default branch.
+     * @param "Revision" (optional.String) -  Branch, tag or commit. Empty means the default branch. It resolves, and is rejected, as the revision of CacheModelRequest.
 
 @return V1alpha1ModelCacheStatus
 */

@@ -17,6 +17,7 @@ package hf
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -58,6 +59,59 @@ const defaultBranchTimeout = 10 * time.Second
 
 type revisionInfo struct {
 	SHA string `json:"sha"`
+	// Gated is false, or how access is granted: "auto" or "manual".
+	Gated json.RawMessage `json:"gated"`
+}
+
+// gated reports whether the repository needs an accepted access request. The
+// Hub lists the files of a gated repository to anyone, but git and file
+// downloads need a credential, which the proxy sync does not send.
+func (i *revisionInfo) gated() bool {
+	switch v := strings.TrimSpace(string(i.Gated)); v {
+	case "", "null", "false":
+		return false
+	default:
+		return true
+	}
+}
+
+// errUndecodable marks an answer that is no JSON of the expected shape.
+var errUndecodable = errors.New("unexpected answer")
+
+// refList is the answer of the refs API: the branches and tags of a
+// repository and the commits they point at.
+type refList struct {
+	Branches []refInfo `json:"branches"`
+	Tags     []refInfo `json:"tags"`
+}
+
+type refInfo struct {
+	Name         string `json:"name"`
+	TargetCommit string `json:"targetCommit"`
+}
+
+// resolve returns what a name points at with git's rules, as go-git applies
+// them on the mirror: refs/<name>, then refs/tags/<name>, then
+// refs/heads/<name>. Only branches and tags count, the refs that the mirror
+// holds.
+func (l *refList) resolve(name string) (string, bool) {
+	refs := make(map[string]string, len(l.Branches)+len(l.Tags))
+	for _, b := range l.Branches {
+		refs["refs/heads/"+b.Name] = b.TargetCommit
+	}
+	for _, t := range l.Tags {
+		refs["refs/tags/"+t.Name] = t.TargetCommit
+	}
+	candidates := []string{name}
+	if !strings.HasPrefix(name, "refs/") {
+		candidates = []string{"refs/" + name, "refs/tags/" + name, "refs/heads/" + name}
+	}
+	for _, c := range candidates {
+		if target := refs[c]; target != "" {
+			return target, true
+		}
+	}
+	return "", false
 }
 
 type treeItem struct {
@@ -73,6 +127,10 @@ type treeItem struct {
 // ListRevisionFiles resolves revision on a Hugging Face-compatible registry and
 // lists every file of the resolved commit. Both huggingface.co (and mirrors)
 // and MatrixHub registries serve this API.
+//
+// The revision resolves as the mirror resolves it when hf download asks
+// MatrixHub for it later, so that the listing names the commit that a pull
+// caches; see revisionToAsk.
 func (d *Discovery) ListRevisionFiles(ctx context.Context, reg *registry.Registry, namespace, name, revision string) (*git.RevisionFiles, error) {
 	base, err := endpointBase(reg)
 	if err != nil {
@@ -80,16 +138,25 @@ func (d *Discovery) ListRevisionFiles(ctx context.Context, reg *registry.Registr
 	}
 	repoPath := url.PathEscape(namespace) + "/" + url.PathEscape(name)
 
+	ask, err := d.revisionToAsk(ctx, base, repoPath, revision)
+	if err != nil {
+		return nil, err
+	}
 	infoURL := base + "/api/models/" + repoPath
-	if revision != "" {
-		infoURL += "/revision/" + url.PathEscape(revision)
+	if ask != "" {
+		infoURL += "/revision/" + url.PathEscape(ask)
 	}
 	var info revisionInfo
 	if _, _, err := d.getJSON(ctx, infoURL, &info); err != nil {
 		return nil, err
 	}
 	if info.SHA == "" {
+		// A MatrixHub registry answers a revision it does not have with an
+		// empty commit.
 		return nil, fmt.Errorf("%w: %s/%s@%s has no commit", registrydiscovery.ErrRemoteNotFound, namespace, name, revision)
+	}
+	if info.gated() {
+		return nil, fmt.Errorf("%w: %w: %s/%s", registrydiscovery.ErrRemoteAccessDenied, registrydiscovery.ErrRemoteGated, namespace, name)
 	}
 
 	files := []git.RevisionFile{}
@@ -118,7 +185,7 @@ func (d *Discovery) ListRevisionFiles(ctx context.Context, reg *registry.Registr
 		if len(files) > maxRevisionFiles {
 			return nil, fmt.Errorf("%w: %s/%s has more than %d files", registrydiscovery.ErrRemoteTooLarge, namespace, name, maxRevisionFiles)
 		}
-		if next = nextLink(header.Get("Link")); next != "" {
+		if next = nextLink(header.Values("Link")); next != "" {
 			// Redirects are followed, as git follows them when the proxy
 			// syncs: hf-mirror.com, for example, may redirect to
 			// huggingface.co, whose links then name huggingface.co. A link
@@ -219,7 +286,7 @@ func (d *Discovery) getJSON(ctx context.Context, u string, out any) (*url.URL, h
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBytes)).Decode(out); err != nil {
 		// For example the HTML error page of a proxy in front of the
 		// registry.
-		return nil, nil, fmt.Errorf("%w: decode response from %s: %w", registrydiscovery.ErrRemoteUnavailable, u, err)
+		return nil, nil, fmt.Errorf("%w: %w: decode response from %s: %w", registrydiscovery.ErrRemoteUnavailable, errUndecodable, u, err)
 	}
 	return resp.Request.URL, resp.Header, nil
 }
@@ -238,24 +305,123 @@ func sameOrigin(page *url.URL, ref string) (string, error) {
 	return resolved.String(), nil
 }
 
-// nextLink extracts the rel="next" target from an RFC 8288 Link header.
-func nextLink(header string) string {
-	for _, part := range strings.Split(header, ",") {
-		segments := strings.Split(part, ";")
-		if len(segments) < 2 {
-			continue
+// revisionToAsk returns the revision to ask the registry for the info of, ""
+// for the default branch. When hf download asks MatrixHub for a revision, the
+// mirror resolves it with git's rules, as go-git applies them: a commit id
+// first, then a tag before a branch of the same name; and it holds only
+// branches and tags. huggingface.co resolves a name with all its refs, so that
+// "pr/1" names refs/pr/1, which a pull cannot fetch. A branch or tag name is
+// therefore resolved here, with the refs that the registry lists. A registry
+// that lists none, answering the refs API with not found or with something
+// other than a list, resolves the name itself.
+func (d *Discovery) revisionToAsk(ctx context.Context, base, repoPath, revision string) (string, error) {
+	switch {
+	case revision == "", revision == "HEAD":
+		return "", nil
+	case isHex(revision):
+		// A registry, like git, prefers a commit to a ref of the same name,
+		// and resolves the ref when no commit matches.
+		return revision, nil
+	}
+	var refs refList
+	_, _, err := d.getJSON(ctx, base+"/api/models/"+repoPath+"/refs", &refs)
+	switch {
+	case err == nil:
+		target, ok := refs.resolve(revision)
+		if !ok {
+			return "", fmt.Errorf("%w: no branch or tag %q", registrydiscovery.ErrRemoteNotFound, revision)
 		}
-		target := strings.TrimSpace(segments[0])
-		if !strings.HasPrefix(target, "<") || !strings.HasSuffix(target, ">") {
-			continue
-		}
-		for _, param := range segments[1:] {
-			if strings.EqualFold(strings.ReplaceAll(strings.TrimSpace(param), " ", ""), `rel="next"`) {
-				return strings.TrimSuffix(strings.TrimPrefix(target, "<"), ">")
+		return target, nil
+	case errors.Is(err, registrydiscovery.ErrRemoteNotFound), errors.Is(err, errUndecodable):
+		return revision, nil
+	default:
+		return "", err
+	}
+}
+
+// isHex reports whether s may be a commit id or a prefix of one.
+func isHex(s string) bool {
+	return len(s) >= 4 && len(s) <= 40 && strings.Trim(s, "0123456789abcdefABCDEF") == ""
+}
+
+// nextLink extracts the target of the link with relation type "next" from
+// Link headers (RFC 8288). A link may hold several relation types, a target
+// may contain commas, and a parameter value may be a token or quoted.
+func nextLink(values []string) string {
+	for _, v := range values {
+		for {
+			start := strings.IndexByte(v, '<')
+			if start < 0 {
+				break
 			}
+			end := strings.IndexByte(v[start:], '>')
+			if end < 0 {
+				break
+			}
+			target := v[start+1 : start+end]
+			params, rest := linkParams(v[start+end+1:])
+			for _, rel := range strings.Fields(params["rel"]) {
+				if strings.EqualFold(rel, "next") {
+					return target
+				}
+			}
+			v = rest
 		}
 	}
 	return ""
+}
+
+// linkParams parses the parameters of one link, up to the comma that ends
+// it, and returns them with the rest of the header.
+func linkParams(s string) (map[string]string, string) {
+	params := map[string]string{}
+	for {
+		s = strings.TrimLeft(s, " \t")
+		if s == "" || s[0] == ',' {
+			return params, strings.TrimPrefix(s, ",")
+		}
+		if s[0] != ';' {
+			// Not a parameter: skip to the next link.
+			i := strings.IndexByte(s, ',')
+			if i < 0 {
+				return params, ""
+			}
+			return params, s[i+1:]
+		}
+		s = strings.TrimLeft(s[1:], " \t")
+		i := strings.IndexAny(s, "=;,")
+		if i < 0 {
+			return params, ""
+		}
+		key := strings.ToLower(strings.TrimSpace(s[:i]))
+		if s[i] != '=' {
+			params[key] = ""
+			s = s[i:]
+			continue
+		}
+		s = strings.TrimLeft(s[i+1:], " \t")
+		var value string
+		if strings.HasPrefix(s, `"`) {
+			var b strings.Builder
+			j := 1
+			for ; j < len(s) && s[j] != '"'; j++ {
+				if s[j] == '\\' && j+1 < len(s) {
+					j++
+				}
+				b.WriteByte(s[j])
+			}
+			value, s = b.String(), s[min(j+1, len(s)):]
+		} else {
+			j := strings.IndexAny(s, ";,")
+			if j < 0 {
+				j = len(s)
+			}
+			value, s = strings.TrimSpace(s[:j]), s[j:]
+		}
+		if _, seen := params[key]; !seen {
+			params[key] = value
+		}
+	}
 }
 
 // retryAfterHint renders a Retry-After header, in seconds or as an HTTP date.

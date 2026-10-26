@@ -40,7 +40,9 @@ func TestDiscovery_ListRevisionFiles(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		switch {
-		case r.URL.EscapedPath() == "/api/models/Qwen/Qwen3-0.6B/revision/refs%2Fpr%2F1":
+		case r.URL.Path == "/api/models/Qwen/Qwen3-0.6B/refs":
+			fmt.Fprintf(w, `{"branches":[{"name":"main","ref":"refs/heads/main","targetCommit":%q}],"tags":[]}`, testSHA)
+		case r.URL.Path == "/api/models/Qwen/Qwen3-0.6B/revision/"+testSHA:
 			fmt.Fprintf(w, `{"sha":%q}`, testSHA)
 		case r.URL.Path == "/api/models/Qwen/Qwen3-0.6B/tree/"+testSHA && r.URL.Query().Get("cursor") == "":
 			if r.URL.Query().Get("recursive") != "true" {
@@ -64,12 +66,12 @@ func TestDiscovery_ListRevisionFiles(t *testing.T) {
 	reg := &registry.Registry{ID: 1, URL: ts.URL}
 	reg.SetCredential(registry.NewBasicCredential("user", "secret"))
 
-	got, err := New().ListRevisionFiles(context.Background(), reg, "Qwen", "Qwen3-0.6B", "refs/pr/1")
+	got, err := New().ListRevisionFiles(context.Background(), reg, "Qwen", "Qwen3-0.6B", "main")
 	if err != nil {
 		t.Fatalf("ListRevisionFiles() error = %v", err)
 	}
 
-	if got.Commit != testSHA || got.Revision != "refs/pr/1" {
+	if got.Commit != testSHA || got.Revision != "main" {
 		t.Fatalf("got %q@%q", got.Revision, got.Commit)
 	}
 	want := []git.RevisionFile{
@@ -247,7 +249,9 @@ func TestDiscovery_ListRevisionFiles_FollowsPaginationAfterRedirect(t *testing.T
 	var target *httptest.Server
 	target = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.URL.Path == "/api/models/Qwen/big/revision/main":
+		case r.URL.Path == "/api/models/Qwen/big/refs":
+			fmt.Fprintf(w, `{"branches":[{"name":"main","targetCommit":%q}],"tags":[]}`, testSHA)
+		case r.URL.Path == "/api/models/Qwen/big/revision/"+testSHA:
 			fmt.Fprintf(w, `{"sha":%q}`, testSHA)
 		case r.URL.Query().Get("cursor") == "":
 			w.Header().Set("Link", fmt.Sprintf(`<%s/api/models/Qwen/big/tree/%s?recursive=true&cursor=p2>; rel="next"`, target.URL, testSHA))
@@ -325,16 +329,228 @@ func TestDiscovery_ListRevisionFiles_NotAListing(t *testing.T) {
 }
 
 func TestNextLink(t *testing.T) {
-	tests := map[string]string{
-		``:                                       ``,
-		`<https://hf.co/a?cursor=1>; rel="next"`: `https://hf.co/a?cursor=1`,
-		`<https://hf.co/p>; rel="prev", <https://hf.co/n>; rel="next"`: `https://hf.co/n`,
-		`<https://hf.co/p>; rel="prev"`:                                ``,
-		`<https://hf.co/n>; foo="bar"; rel = "next"`:                   `https://hf.co/n`,
+	tests := []struct {
+		headers []string
+		want    string
+	}{
+		{nil, ``},
+		{[]string{``}, ``},
+		{[]string{`<https://hf.co/a?cursor=1>; rel="next"`}, `https://hf.co/a?cursor=1`},
+		{[]string{`<https://hf.co/p>; rel="prev", <https://hf.co/n>; rel="next"`}, `https://hf.co/n`},
+		{[]string{`<https://hf.co/p>; rel="prev"`}, ``},
+		{[]string{`<https://hf.co/n>; foo="bar"; rel = "next"`}, `https://hf.co/n`},
+		// RFC 8288 also allows a token value, several relation types, a
+		// comma in the target, a quoted comma, and links in several headers.
+		{[]string{`<https://hf.co/n>; rel=next`}, `https://hf.co/n`},
+		{[]string{`<https://hf.co/n>; rel="prev next"`}, `https://hf.co/n`},
+		{[]string{`<https://hf.co/a?c=1,2>; rel="next"`}, `https://hf.co/a?c=1,2`},
+		{[]string{`<https://hf.co/p>; title="a, b"; rel="prev", <https://hf.co/n>; rel="next"`}, `https://hf.co/n`},
+		{[]string{`<https://hf.co/p>; rel="prev"`, `<https://hf.co/n>; rel="next"`}, `https://hf.co/n`},
+		{[]string{`<https://hf.co/n>; rel="nextpage"`}, ``},
+		// Only the first rel parameter counts.
+		{[]string{`<https://hf.co/n>; rel="prev"; rel="next"`}, ``},
 	}
-	for header, want := range tests {
-		if got := nextLink(header); got != want {
-			t.Errorf("nextLink(%q) = %q, want %q", header, got, want)
+	for _, tt := range tests {
+		if got := nextLink(tt.headers); got != tt.want {
+			t.Errorf("nextLink(%q) = %q, want %q", tt.headers, got, tt.want)
 		}
+	}
+}
+
+func TestDiscovery_ListRevisionFiles_Gated(t *testing.T) {
+	tests := []struct {
+		gated     string
+		wantGated bool
+	}{
+		{``, false},
+		{`,"gated":false`, false},
+		{`,"gated":null`, false},
+		{`,"gated":"manual"`, true},
+		{`,"gated":"auto"`, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.gated, func(t *testing.T) {
+			// The Hub lists the files of a gated repository to anyone; only
+			// the gated field of its info tells that a pull would fail.
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/api/models/meta-llama/Llama-2-7b-hf" {
+					fmt.Fprintf(w, `{"sha":%q%s}`, testSHA, tt.gated)
+					return
+				}
+				if strings.Contains(r.URL.Path, "/tree/") {
+					fmt.Fprint(w, `[{"type":"file","path":"config.json","size":1}]`)
+					return
+				}
+				w.WriteHeader(http.StatusNotFound)
+			}))
+			defer ts.Close()
+
+			_, err := New().ListRevisionFiles(context.Background(), &registry.Registry{URL: ts.URL}, "meta-llama", "Llama-2-7b-hf", "")
+			if !tt.wantGated {
+				if err != nil {
+					t.Fatalf("ListRevisionFiles() error = %v", err)
+				}
+				return
+			}
+			if !errors.Is(err, registrydiscovery.ErrRemoteAccessDenied) || !errors.Is(err, registrydiscovery.ErrRemoteGated) {
+				t.Fatalf("ListRevisionFiles() error = %v, want a gated access denial", err)
+			}
+		})
+	}
+}
+
+// fakeRefsRegistry serves a repository org/model with the refs API answering
+// refs, unless it is empty; the info of the commits in shas, keyed by the
+// escaped revision asked for; and a tree for any commit. It records the
+// revisions whose info was asked for.
+func fakeRefsRegistry(t *testing.T, refs string, shas map[string]string) (*httptest.Server, *[]string) {
+	t.Helper()
+	var asked []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		const prefix = "/api/models/org/model"
+		switch path := r.URL.EscapedPath(); {
+		case path == prefix+"/refs":
+			if refs == "" {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			fmt.Fprint(w, refs)
+		case strings.HasPrefix(path, prefix+"/tree/"):
+			fmt.Fprint(w, `[{"type":"file","path":"config.json","size":1}]`)
+		case path == prefix || strings.HasPrefix(path, prefix+"/revision/"):
+			rev := strings.TrimPrefix(strings.TrimPrefix(path, prefix), "/revision/")
+			asked = append(asked, rev)
+			if sha, ok := shas[rev]; ok {
+				fmt.Fprintf(w, `{"sha":%q}`, sha)
+				return
+			}
+			w.Header().Set("X-Error-Code", "RevisionNotFound")
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(ts.Close)
+	return ts, &asked
+}
+
+func TestDiscovery_ListRevisionFiles_ResolvesAsTheMirror(t *testing.T) {
+	const (
+		tagSHA    = "1111111111111111111111111111111111111111"
+		branchSHA = "2222222222222222222222222222222222222222"
+		prSHA     = "3333333333333333333333333333333333333333"
+	)
+	// Upstream has a branch and a tag v1.0, a branch named like a pull
+	// request, and a branch dev. huggingface.co would resolve "pr/121" to
+	// its refs/pr/121, which the mirror does not hold.
+	refs := fmt.Sprintf(`{
+		"branches":[{"name":"main","targetCommit":%[2]q},{"name":"v1.0","targetCommit":%[2]q},{"name":"pr/121","targetCommit":%[2]q},{"name":"dev","targetCommit":%[2]q}],
+		"tags":[{"name":"v1.0","targetCommit":%[1]q}]}`, tagSHA, branchSHA)
+	infos := map[string]string{"": branchSHA, tagSHA: tagSHA, branchSHA: branchSHA, "c1899de": testSHA, "pr%2F121": prSHA}
+	tests := []struct {
+		name      string
+		revision  string
+		wantSHA   string
+		wantAsked string
+	}{
+		// git, and so the mirror, prefers a tag to a branch of the same name.
+		{"tag before branch", "v1.0", tagSHA, tagSHA},
+		{"branch", "main", branchSHA, branchSHA},
+		{"branch named like a pull request", "pr/121", branchSHA, branchSHA},
+		{"name relative to refs/", "heads/dev", branchSHA, branchSHA},
+		{"full ref name", "refs/heads/main", branchSHA, branchSHA},
+		{"commit", "c1899de", testSHA, "c1899de"},
+		{"default branch", "", branchSHA, ""},
+		{"HEAD", "HEAD", branchSHA, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ts, asked := fakeRefsRegistry(t, refs, infos)
+			got, err := New().ListRevisionFiles(context.Background(), &registry.Registry{URL: ts.URL}, "org", "model", tt.revision)
+			if err != nil {
+				t.Fatalf("ListRevisionFiles() error = %v", err)
+			}
+			if got.Commit != tt.wantSHA {
+				t.Fatalf("commit = %q, want %q", got.Commit, tt.wantSHA)
+			}
+			if len(*asked) != 1 || (*asked)[0] != tt.wantAsked {
+				t.Fatalf("asked for the info of %q, want %q", *asked, tt.wantAsked)
+			}
+		})
+	}
+}
+
+func TestDiscovery_ListRevisionFiles_NameOutsideBranchesAndTags(t *testing.T) {
+	// Upstream resolves "pr/1" to refs/pr/1, which a pull cannot fetch.
+	refs := fmt.Sprintf(`{"branches":[{"name":"main","targetCommit":%q}],"tags":[]}`, testSHA)
+	ts, asked := fakeRefsRegistry(t, refs, map[string]string{"pr%2F1": testSHA})
+
+	_, err := New().ListRevisionFiles(context.Background(), &registry.Registry{URL: ts.URL}, "org", "model", "pr/1")
+
+	if !errors.Is(err, registrydiscovery.ErrRemoteNotFound) {
+		t.Fatalf("ListRevisionFiles() error = %v, want not found", err)
+	}
+	if len(*asked) != 0 {
+		t.Fatalf("asked for the info of %q, want nothing", *asked)
+	}
+}
+
+// A registry without the refs API resolves names itself.
+func TestDiscovery_ListRevisionFiles_RegistryWithoutRefs(t *testing.T) {
+	ts, asked := fakeRefsRegistry(t, "", map[string]string{"main": testSHA})
+
+	got, err := New().ListRevisionFiles(context.Background(), &registry.Registry{URL: ts.URL}, "org", "model", "main")
+
+	if err != nil {
+		t.Fatalf("ListRevisionFiles() error = %v", err)
+	}
+	if got.Commit != testSHA || strings.Join(*asked, " ") != "main" {
+		t.Fatalf("got commit %q after asking for %q", got.Commit, *asked)
+	}
+}
+
+func TestDiscovery_ListRevisionFiles_RefsAnswerThatIsNoList(t *testing.T) {
+	ts, asked := fakeRefsRegistry(t, `<html>not an API</html>`, map[string]string{"main": testSHA})
+
+	got, err := New().ListRevisionFiles(context.Background(), &registry.Registry{URL: ts.URL}, "org", "model", "main")
+
+	if err != nil || got.Commit != testSHA || strings.Join(*asked, " ") != "main" {
+		t.Fatalf("got %v, %v after asking for %q; want the name resolved by the registry", got, err, *asked)
+	}
+}
+
+func TestDiscovery_ListRevisionFiles_RefsUnavailable(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/refs") {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		t.Errorf("unexpected request %s", r.URL)
+	}))
+	defer ts.Close()
+
+	_, err := New().ListRevisionFiles(context.Background(), &registry.Registry{URL: ts.URL}, "org", "model", "main")
+
+	if !errors.Is(err, registrydiscovery.ErrRemoteUnavailable) {
+		t.Fatalf("ListRevisionFiles() error = %v, want unavailable", err)
+	}
+}
+
+func TestDiscovery_ListRevisionFiles_MissingRepository(t *testing.T) {
+	var requests atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		// huggingface.co answers a missing repository with a bare 401.
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer ts.Close()
+
+	_, err := New().ListRevisionFiles(context.Background(), &registry.Registry{URL: ts.URL}, "org", "missing", "main")
+
+	if !errors.Is(err, registrydiscovery.ErrRemoteNotFound) {
+		t.Fatalf("ListRevisionFiles() error = %v, want not found", err)
+	}
+	if got := requests.Load(); got > 2 {
+		t.Fatalf("made %d requests, want at most 2", got)
 	}
 }

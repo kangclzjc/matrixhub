@@ -57,7 +57,7 @@ type ModelsClient interface {
 	// cached: it never syncs, creates the model, or starts downloads.
 	CacheModel(ctx context.Context, in *CacheModelRequest, opts ...grpc.CallOption) (*ModelCacheStatus, error)
 	// GetModelCache reports the local cache status of every file of a model
-	// revision, and the latest pull of that commit. It is read-only: it never
+	// revision, and the latest pull of its files. It is read-only: it never
 	// contacts upstream and never starts downloads.
 	GetModelCache(ctx context.Context, in *GetModelCacheRequest, opts ...grpc.CallOption) (*ModelCacheStatus, error)
 }
@@ -232,7 +232,7 @@ type ModelsServer interface {
 	// cached: it never syncs, creates the model, or starts downloads.
 	CacheModel(context.Context, *CacheModelRequest) (*ModelCacheStatus, error)
 	// GetModelCache reports the local cache status of every file of a model
-	// revision, and the latest pull of that commit. It is read-only: it never
+	// revision, and the latest pull of its files. It is read-only: it never
 	// contacts upstream and never starts downloads.
 	GetModelCache(context.Context, *GetModelCacheRequest) (*ModelCacheStatus, error)
 }

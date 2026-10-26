@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/sync/singleflight"
 
@@ -91,10 +92,17 @@ func NewModelCacheService(
 	}
 }
 
-func (s *Service) CacheModel(ctx context.Context, req *Request) (*CacheStatus, error) {
+func (s *Service) CacheModel(ctx context.Context, req *Request) (_ *CacheStatus, err error) {
 	if s.ctx.Err() != nil {
 		return nil, ErrClosed
 	}
+	ctx, done := s.untilClosed(ctx)
+	defer func() {
+		if err != nil && errors.Is(context.Cause(ctx), ErrClosed) {
+			err = ErrClosed
+		}
+		done()
+	}()
 	if err := validateRevision(req.Revision); err != nil {
 		return nil, err
 	}
@@ -112,13 +120,13 @@ func (s *Service) CacheModel(ctx context.Context, req *Request) (*CacheStatus, e
 		if err != nil {
 			return nil, err
 		}
-		p, err := sel.plan(remote.Files)
+		p, err := sel.plan(ctx, remote.Files)
 		if err != nil {
 			return nil, err
 		}
 		s.gc()
 		gitCached := s.localHasCommit(ctx, req.Project, req.Name, remote.Commit)
-		t := s.lookupTask(taskKey(req.Project, req.Name, p.objects))
+		t := s.reportable(ctx, s.lookupTask(taskKey(req.Project, req.Name, p.objects)))
 		return s.buildStatus(ctx, req.Project, req.Name, req.Revision, remote, p, t, gitCached), nil
 	}
 
@@ -130,21 +138,23 @@ func (s *Service) CacheModel(ctx context.Context, req *Request) (*CacheStatus, e
 	}
 	defer unlock()
 
-	existed, err := s.modelExists(ctx, req.Project, req.Name)
+	m, err := s.findModel(ctx, req.Project, req.Name)
 	if err != nil {
 		return nil, err
 	}
-	// remote is only listed for a new model: the sync creates the model, so
-	// everything that upstream can tell is checked first, and a request that
-	// cannot succeed creates nothing. A sync that fails after that keeps the
-	// model, as a failed proxy download does, and the next pull or download
-	// syncs it again.
+	// remote is only listed for a model that has not synced yet: for a new
+	// model the sync creates it, so everything that upstream can tell is
+	// checked first, and a request that cannot succeed creates nothing; a
+	// model whose first sync failed gets the same answers, such as a gated
+	// repository, instead of failing the sync again. A sync that fails after
+	// that keeps the model, as a failed proxy download does, and the next
+	// pull or download syncs it again.
 	var remote *git.RevisionFiles
-	if !existed {
+	if m == nil || m.SyncedAt == nil {
 		if remote, err = s.listUpstream(ctx, prj, reg, req.Name, req.Revision); err != nil {
 			return nil, err
 		}
-		p, err := sel.plan(remote.Files)
+		p, err := sel.plan(ctx, remote.Files)
 		if err != nil {
 			return nil, err
 		}
@@ -173,7 +183,7 @@ func (s *Service) CacheModel(ctx context.Context, req *Request) (*CacheStatus, e
 		return nil, err
 	}
 
-	p, err := sel.plan(local.Files)
+	p, err := sel.plan(ctx, local.Files)
 	if err != nil {
 		return nil, err
 	}
@@ -190,6 +200,9 @@ func (s *Service) CacheModel(ctx context.Context, req *Request) (*CacheStatus, e
 }
 
 func (s *Service) GetModelCache(ctx context.Context, project, name, revision string) (*CacheStatus, error) {
+	if err := validateRevision(revision); err != nil {
+		return nil, err
+	}
 	m, err := s.models.GetModel(ctx, project, name)
 	if err != nil {
 		if isNotFound(err) {
@@ -220,12 +233,12 @@ func (s *Service) GetModelCache(ctx context.Context, project, name, revision str
 	if err != nil {
 		return nil, err
 	}
-	p, err := selectAll.plan(local.Files)
+	p, err := selectAll.plan(ctx, local.Files)
 	if err != nil {
 		return nil, err
 	}
 	s.gc()
-	t := s.latestTask(project, name, local.Commit, p.objects)
+	t := s.reportable(ctx, s.latestTask(project, name, local.Commit, p.objects))
 	return s.buildStatus(ctx, project, name, revision, local, p, t, true), nil
 }
 
@@ -236,6 +249,18 @@ func (s *Service) Close() {
 	s.cancel()
 	s.mu.Unlock()
 	s.wg.Wait()
+}
+
+// untilClosed returns ctx, also ended with the cause ErrClosed once the
+// service closes, so that a request waiting for a model lock or a sync does
+// not hold up shutdown. Call the returned function when the request ends.
+func (s *Service) untilClosed(ctx context.Context) (context.Context, func()) {
+	ctx, cancel := context.WithCancelCause(ctx)
+	stop := context.AfterFunc(s.ctx, func() { cancel(ErrClosed) })
+	return ctx, func() {
+		stop()
+		cancel(nil)
+	}
 }
 
 // validateRevision accepts the default branch (empty), branch and tag names,
@@ -253,6 +278,11 @@ func validateRevision(revision string) error {
 	}
 	if !isRefName(revision) {
 		return fmt.Errorf("%w: %q is not a branch, tag or commit name", ErrUnsupportedRevision, revision)
+	}
+	// git allows '@' in ref names, but the revision syntax of go-git, which
+	// MatrixHub resolves revisions with, rejects it.
+	if strings.Contains(revision, "@") {
+		return fmt.Errorf("%w: MatrixHub cannot resolve %q, which contains '@'", ErrUnsupportedRevision, revision)
 	}
 	return nil
 }
@@ -305,7 +335,10 @@ func (s *Service) fetchRevision(ctx context.Context, prj *project.Project, reg *
 			return local, err
 		}
 	}
-	return nil, fmt.Errorf("%w: %s resolves to %s upstream", ErrRevisionNotMirrored, revisionLabel(req.Revision), remote.Commit)
+	// Forced syncs of a model are rate limited, so a branch or tag created
+	// upstream right after the last one is not mirrored yet.
+	return nil, fmt.Errorf("%w: %s resolves to %s upstream; if it was created there just now, pull again in a few seconds",
+		ErrRevisionNotMirrored, revisionLabel(req.Revision), remote.Commit)
 }
 
 func revisionLabel(revision string) string {
@@ -336,13 +369,34 @@ func (s *Service) lockModel(ctx context.Context, key string) (func(), error) {
 	}
 	select {
 	case l.ch <- struct{}{}:
+		// select picks at random when the request also ended meanwhile. The
+		// service context is checked too: untilClosed ends ctx only soon
+		// after the service closes, and the pull that held the lock may
+		// have returned already.
+		if err := s.lockedCtxErr(ctx); err != nil {
+			<-l.ch
+			release()
+			return nil, err
+		}
 		return func() {
 			<-l.ch
 			release()
 		}, nil
 	case <-ctx.Done():
 		release()
-		return nil, ctx.Err()
+		return nil, context.Cause(ctx)
+	}
+}
+
+// lockedCtxErr reports why a request that got its model lock must not go on.
+func (s *Service) lockedCtxErr(ctx context.Context) error {
+	switch {
+	case ctx.Err() != nil:
+		return context.Cause(ctx)
+	case s.ctx.Err() != nil:
+		return ErrClosed
+	default:
+		return nil
 	}
 }
 
@@ -389,10 +443,12 @@ func (s *Service) listLocal(ctx context.Context, project, name, revision string)
 }
 
 // localHasCommit reports whether the local repository already has commit,
-// i.e. whether the files stored in git are cached.
+// i.e. whether the files stored in git are cached. A model that never synced
+// holds only its placeholder commit, so it has nothing cached and its
+// repository is not read.
 func (s *Service) localHasCommit(ctx context.Context, project, name, commit string) bool {
-	exists, err := s.modelExists(ctx, project, name)
-	if err != nil || !exists {
+	m, err := s.findModel(ctx, project, name)
+	if err != nil || m == nil || m.SyncedAt == nil {
 		return false
 	}
 	return s.git.HasCommit(ctx, repoTypeModels, project, name, commit)
@@ -409,15 +465,16 @@ func (s *Service) missingObjects(ctx context.Context, oids []string) []string {
 	return missing
 }
 
-func (s *Service) modelExists(ctx context.Context, project, name string) (bool, error) {
-	_, err := s.models.GetModel(ctx, project, name)
+// findModel returns the model, or nil when it does not exist.
+func (s *Service) findModel(ctx context.Context, project, name string) (*model.Model, error) {
+	m, err := s.models.GetModel(ctx, project, name)
 	if err == nil {
-		return true, nil
+		return m, nil
 	}
 	if isNotFound(err) {
-		return false, nil
+		return nil, nil
 	}
-	return false, err
+	return nil, err
 }
 
 func (s *Service) lookupTask(key string) *task {
@@ -426,30 +483,63 @@ func (s *Service) lookupTask(key string) *task {
 	return s.tasks[key]
 }
 
-// latestTask returns the task to report for the objects of a commit: one that
-// is running, or else the one started last. Tasks of narrower selections
-// count, and so do running tasks of another commit that pull some of the
-// objects, as after the branch moved during a pull.
+// latestTask returns the task to report for a revision of commit whose LFS
+// objects are objects. A run counts when every object it pulls belongs to the
+// revision: runs of narrower selections do, and so do runs of another commit
+// with the same objects, as after the branch moved during a pull; a run that
+// also pulls other objects, such as one of another branch that shares some,
+// does not. Of those, a running run comes first, then a run of commit, then
+// the run started last.
 func (s *Service) latestTask(project, name, commit string, objects []string) *task {
+	inRevision := make(map[string]struct{}, len(objects))
+	for _, oid := range objects {
+		inRevision[oid] = struct{}{}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var latest *task
-	latestRunning := false
+	var latestRank taskRank
 	for _, t := range s.tasks {
-		if t.project != project || t.name != name {
+		if t.project != project || t.name != name || !t.within(inRevision) {
 			continue
 		}
-		running := t.running()
-		if t.commit != commit && (!running || !t.hasAny(objects)) {
-			continue
-		}
-		if latest == nil ||
-			(running && !latestRunning) ||
-			(running == latestRunning && t.startedAt.After(latest.startedAt)) {
-			latest, latestRunning = t, running
+		rank := taskRank{running: t.running(), ofCommit: t.commit == commit, startedAt: t.startedAt}
+		if latest == nil || rank.before(latestRank) {
+			latest, latestRank = t, rank
 		}
 	}
 	return latest
+}
+
+// taskRank orders the runs that latestTask may report.
+type taskRank struct {
+	running, ofCommit bool
+	startedAt         time.Time
+}
+
+func (r taskRank) before(o taskRank) bool {
+	if r.running != o.running {
+		return r.running
+	}
+	if r.ofCommit != o.ofCommit {
+		return r.ofCommit
+	}
+	return r.startedAt.After(o.startedAt)
+}
+
+// reportable returns t, unless t failed and every object that it failed is
+// stored by now: its failures no longer hold, and a pull of its selection
+// would not report it either; see startOrAttach.
+func (s *Service) reportable(ctx context.Context, t *task) *task {
+	if t == nil || !t.failed() {
+		return t
+	}
+	for _, oid := range t.failedObjects() {
+		if !s.git.LFSObjectExists(ctx, oid) {
+			return t
+		}
+	}
+	return nil
 }
 
 // checkCapacity reports ErrTooManyTasks before a new model is created;

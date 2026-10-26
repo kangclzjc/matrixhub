@@ -8,7 +8,7 @@
  */
 
 package v1alpha1
-// V1alpha1CacheFileState :  - CACHE_FILE_STATE_QUEUED: Part of a running cache task, not started yet.
+// V1alpha1CacheFileState :  - CACHE_FILE_STATE_QUEUED: Part of a running cache task, not started yet, or waiting for its next attempt; error then tells why the last attempt failed.
 type V1alpha1CacheFileState string
 
 // List of v1alpha1CacheFileState
