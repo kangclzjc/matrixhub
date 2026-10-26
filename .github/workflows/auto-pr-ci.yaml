@@ -44,6 +44,7 @@ jobs:
               - 'test/**'
               - '**/*.sh'
               - '**/*.go'
+              - '.github/workflows/e2e-sqlite-compose.yaml'
               - 'go.mod'
               - 'go.sum'
               - 'deploy/charts/**'
@@ -125,4 +126,14 @@ jobs:
       image_tag: ${{ needs.call_build_ci_image.outputs.imageTag }}
       ref: ${{ needs.get_ref.outputs.ref }}
       e2e_labels: ${{ needs.get_ref.outputs.e2e_labels }}
+    secrets: inherit
+
+  e2e_test_sqlite_compose:
+    needs: [call_build_ci_image, get_ref]
+    if: ${{ needs.get_ref.outputs.e2e_enabled == 'true' }}
+    uses: ./.github/workflows/e2e-sqlite-compose.yaml
+    with:
+      image_tag: ${{ needs.call_build_ci_image.outputs.imageTag }}
+      ref: ${{ needs.get_ref.outputs.ref }}
+      e2e_labels: smoke
     secrets: inherit
