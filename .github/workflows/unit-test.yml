@@ -11,6 +11,9 @@ on:
       - 'internal/**'
       - 'go.mod'
       - 'go.sum'
+      - 'Makefile'
+      - 'scripts/unit-test.sh'
+      - '.github/workflows/unit-test.yml'
 
   pull_request:
     branches:
@@ -22,12 +25,17 @@ on:
       - 'internal/**'
       - 'go.mod'
       - 'go.sum'
+      - 'Makefile'
+      - 'scripts/unit-test.sh'
+      - '.github/workflows/unit-test.yml'
 
 jobs:
   go-unit-test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -47,5 +55,13 @@ jobs:
       - name: Install dependencies
         run: pip install huggingface_hub
 
-      - name: Run unit tests
-        run: make test.unit
+      - name: Run unit tests with coverage
+        run: make test.unit.coverage
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./coverage.out
+          flags: unittests
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}

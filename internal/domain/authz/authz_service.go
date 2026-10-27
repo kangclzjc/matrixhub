@@ -28,6 +28,8 @@ import (
 	"github.com/matrixhub-ai/matrixhub/internal/domain/user"
 )
 
+//go:generate go tool mockgen -source=authz_service.go -destination=mocks/authz_service_mock.go -package=mocks
+
 // IAuthzService permission verification service interface
 type IAuthzService interface {
 	// GetUserPermissions gets user's permission list in a project
