@@ -112,13 +112,12 @@ env:
   MAINTAINERS: |-
     wzshiming
 
-  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   GH_REPOSITORY: ${{ github.repository }}
 
   # Login the bot comments as, used to find its own comments. Only needed
   # with a GitHub App installation token, which cannot resolve it via the
   # API: set it to "<app-slug>[bot]".
-  # BOT_LOGIN: ""
+  BOT_LOGIN: ${{ vars.CI_BOT_APP_LOGIN }}
 
   # It can be `merge`, `rebase`, or `squash`.
   DEFAULT_MERGE_METHOD: squash
@@ -177,31 +176,34 @@ env:
 
     </details>
 
-# https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#permissions
-permissions:
-  actions: write
-  checks: read
-  contents: write
-  deployments: none
-  id-token: none
-  issues: write
-  discussions: read
-  packages: none
-  pages: none
-  pull-requests: write
-  repository-projects: read
-  security-events: none
-  statuses: read
+# The bot authenticates with its short-lived GitHub App installation token.
+# Keep the automatically-created GITHUB_TOKEN unprivileged.
+permissions: {}
 
 jobs:
   bot:
     name: Bot
     runs-on: ubuntu-latest
     steps:
+      - name: Generate CI Bot installation token
+        id: generate_ci_bot_token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.CI_BOT_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CI_BOT_APP_PRIVATE_KEY }}
+          permission-actions: write
+          permission-checks: read
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+          permission-statuses: read
+          permission-workflows: write
+
       - name: Issue Opened
         uses: wzshiming/gh-ci-bot@v1.8.0
         if: ${{ github.event_name == 'issues' && github.event.action == 'opened' }}
         env:
+          GH_TOKEN: ${{ steps.generate_ci_bot_token.outputs.token }}
           LOGIN: ${{ github.event.issue.user.login }}
           AUTHOR: ${{ github.event.issue.user.login }}
           MESSAGE: ${{ github.event.issue.body }}
@@ -218,6 +220,7 @@ jobs:
         uses: wzshiming/gh-ci-bot@v1.8.0
         if: ${{ github.event_name == 'pull_request_target' && github.event.action == 'opened' }}
         env:
+          GH_TOKEN: ${{ steps.generate_ci_bot_token.outputs.token }}
           LOGIN: ${{ github.event.pull_request.user.login }}
           AUTHOR: ${{ github.event.pull_request.user.login }}
           MESSAGE: ${{ github.event.pull_request.body }}
@@ -235,6 +238,7 @@ jobs:
         uses: wzshiming/gh-ci-bot@v1.8.0
         if: ${{ github.event_name == 'pull_request_target' && github.event.action == 'synchronize' }}
         env:
+          GH_TOKEN: ${{ steps.generate_ci_bot_token.outputs.token }}
           LOGIN: ${{ github.event.pull_request.user.login }}
           AUTHOR: ${{ github.event.pull_request.user.login }}
           MESSAGE: ""
@@ -247,6 +251,7 @@ jobs:
         uses: wzshiming/gh-ci-bot@v1.8.0
         if: ${{ github.event_name == 'pull_request_target' && (github.event.action == 'edited' || github.event.action == 'converted_to_draft' || github.event.action == 'ready_for_review' || github.event.action == 'reopened') }}
         env:
+          GH_TOKEN: ${{ steps.generate_ci_bot_token.outputs.token }}
           LOGIN: ${{ github.event.pull_request.user.login }}
           AUTHOR: ${{ github.event.pull_request.user.login }}
           MESSAGE: ""
@@ -259,6 +264,7 @@ jobs:
         uses: wzshiming/gh-ci-bot@v1.8.0
         if: ${{ github.event_name == 'issues' && (github.event.action == 'labeled' || github.event.action == 'unlabeled') }}
         env:
+          GH_TOKEN: ${{ steps.generate_ci_bot_token.outputs.token }}
           LOGIN: ${{ github.event.sender.login }}
           AUTHOR: ${{ github.event.issue.user.login }}
           MESSAGE: ""
@@ -271,6 +277,7 @@ jobs:
         uses: wzshiming/gh-ci-bot@v1.8.0
         if: ${{ github.event_name == 'pull_request_target' && (github.event.action == 'labeled' || github.event.action == 'unlabeled') }}
         env:
+          GH_TOKEN: ${{ steps.generate_ci_bot_token.outputs.token }}
           LOGIN: ${{ github.event.sender.login }}
           AUTHOR: ${{ github.event.pull_request.user.login }}
           MESSAGE: ""
@@ -283,6 +290,7 @@ jobs:
         uses: wzshiming/gh-ci-bot@v1.8.0
         if: ${{ github.event_name == 'issue_comment' && !github.event.issue.pull_request }}
         env:
+          GH_TOKEN: ${{ steps.generate_ci_bot_token.outputs.token }}
           LOGIN: ${{ github.event.comment.user.login }}
           AUTHOR: ${{ github.event.issue.user.login }}
           MESSAGE: ${{ github.event.comment.body }}
@@ -295,6 +303,7 @@ jobs:
         uses: wzshiming/gh-ci-bot@v1.8.0
         if: ${{ github.event_name == 'pull_request_review_comment' }}
         env:
+          GH_TOKEN: ${{ steps.generate_ci_bot_token.outputs.token }}
           LOGIN: ${{ github.event.comment.user.login }}
           AUTHOR: ${{ github.event.pull_request.user.login }}
           MESSAGE: ${{ github.event.comment.body }}
@@ -307,6 +316,7 @@ jobs:
         uses: wzshiming/gh-ci-bot@v1.8.0
         if: ${{ github.event_name == 'pull_request_review' && github.event.review.body != '' }}
         env:
+          GH_TOKEN: ${{ steps.generate_ci_bot_token.outputs.token }}
           LOGIN: ${{ github.event.review.user.login }}
           AUTHOR: ${{ github.event.pull_request.user.login }}
           MESSAGE: ${{ github.event.review.body }}
@@ -319,6 +329,7 @@ jobs:
         uses: wzshiming/gh-ci-bot@v1.8.0
         if: ${{ github.event_name == 'issue_comment' && github.event.issue.pull_request }}
         env:
+          GH_TOKEN: ${{ steps.generate_ci_bot_token.outputs.token }}
           LOGIN: ${{ github.event.comment.user.login }}
           AUTHOR: ${{ github.event.issue.user.login }}
           MESSAGE: ${{ github.event.comment.body }}
